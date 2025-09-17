@@ -29,8 +29,8 @@ class JSDivergence(nn.Module):
     def forward(self, v_alpha, t_alpha):
         batch_size = v_alpha.shape[0]
         batch_size_t = t_alpha.shape[0]
-        v_alpha = v_alpha.repeat_interleave(batch_size, dim=0)
-        t_alpha = t_alpha.repeat(batch_size,1)
+        v_alpha = v_alpha.repeat(batch_size_t, 1)                  # 扩展为 [M*N, C]
+        t_alpha = t_alpha.repeat_interleave(batch_size, dim=0)     # 扩展为 [M*N, C]
         jsd = 0.5*self.compute_KL(v_alpha, 0.5*(v_alpha+t_alpha)) + 0.5*self.compute_KL(t_alpha, 0.5*(v_alpha+t_alpha))
         jsd = jsd.view(batch_size_t, batch_size)
         sim = 1-jsd
