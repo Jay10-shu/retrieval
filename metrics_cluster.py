@@ -73,8 +73,8 @@ def get_max_indices(a,b,top_k=10):
 def clusterSim_jsd(v_alpha, t_alpha):
     batch_size = v_alpha.shape[0]
     batch_size_t = t_alpha.shape[0]
-    v_alpha = v_alpha.repeat_interleave(batch_size_t, dim=0)
-    t_alpha = t_alpha.repeat(batch_size,1)
+    v_alpha = v_alpha.repeat(batch_size_t, 1)                  # 扩展为 [M*N, C]
+    t_alpha = t_alpha.repeat_interleave(batch_size, dim=0)     # 扩展为 [M*N, C]
     JSD = 0.5*compute_KL(v_alpha, 0.5*(v_alpha + t_alpha)) + 0.5*compute_KL(t_alpha, 0.5*(v_alpha + t_alpha))
     JSD = JSD.view(batch_size, batch_size_t)
     Sim = 1-JSD
