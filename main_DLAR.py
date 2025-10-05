@@ -9,13 +9,13 @@ import random
 import os
 import copy
 from tqdm import tqdm
-from metrics_cluster import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim,clusterSim_jsd
+from metrics_cluster1 import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim,clusterSim_jsd
 import time
 import argparse
 from datetime import timedelta
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from modules.modeling_DLAR import DLAR
+from modules.modeling_DLAR1 import DLAR
 from modules.optimization import BertAdam
 from scipy.optimize import minimize
 import torch.nn.functional as F
@@ -46,6 +46,7 @@ def get_args(description='DLAR on Retrieval Task'):
     parser.add_argument('--n_display', type=int, default=100, help='Information display frequence')
     parser.add_argument('--video_dim', type=int, default=1024, help='video feature dimension')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument('--max_words', type=int, default=20, help='')
     parser.add_argument('--max_frames', type=int, default=100, help='')
     parser.add_argument('--feature_framerate', type=int, default=1, help='')
@@ -226,7 +227,7 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
-    if epoch <= 1:  
+    if epoch <= 2:  
         print(f'load zero prototype {epoch}') 
         v_prototype = torch.zeros(args.num_clusters, 512)
         t_prototype = torch.zeros(args.num_clusters, 512)
@@ -237,9 +238,10 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
             v_prototype = torch.from_numpy(v_prototype)
         if isinstance(t_prototype, np.ndarray):   
             t_prototype = torch.from_numpy(t_prototype)
+
     for step, batch in enumerate(train_dataloader):
         input_ids, input_mask, segment_ids, video, video_mask = batch
-        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, v_prototype, t_prototype, video_mask)
+        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, v_prototype.detach(), t_prototype.detach(), video_mask)
         if n_gpu > 1:
             loss = loss.mean()
         if args.gradient_accumulation_steps > 1:
@@ -266,8 +268,7 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
     total_loss = total_loss / len(train_dataloader)
-    # if epoch != args.epochs - 1 and epoch !=0 :
-    if epoch != args.epochs - 1:
+    if epoch != args.epochs - 1 and epoch !=0 and epoch !=1:
         extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, epoch, args, name=f'membership_contours_{epoch}')
     return total_loss, global_step
 
@@ -360,7 +361,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # ----------------------------------
         # 2. calculate the similarity
         # ----------------------------------
-        if epoch <= 1:
+        if epoch <= 2:
             # print('Test................................... ONLY SIM_feature epoch:',epoch)
             sim_feature, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
@@ -371,26 +372,39 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
             sim_feature, sim_cluster= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
             sim_cluster = torch.cat(tuple(sim_cluster), axis=0)
-            sim_all = args.lambda1*sim_feature + args.lambda2*sim_cluster
+            sim_all = args.lambda1*sim_feature + 0.1*sim_cluster
+
+
 
 
     #####################################################
     if multi_sentence_:
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        ############sim_feature
+        logger.info("before reshape, sim matrix size: {} x {}".format(sim_feature.shape[0], sim_feature.shape[1]))
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
         max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
         sim_matrix_new = []
         for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            sim_matrix_new.append(torch.cat((sim_matrix[s_:e_].to(device),
-                                                  torch.full((max_length-e_+s_, sim_matrix.shape[1]), -float('inf')).to(device)), axis=0))
-        sim_matrix = torch.stack(tuple(sim_matrix_new), axis=0)
+            sim_matrix_new.append(torch.cat((sim_feature[s_:e_].to(device),
+                                                  torch.full((max_length-e_+s_, sim_feature.shape[1]), -float('inf')).to(device)), axis=0))
+        sim_feature = torch.stack(tuple(sim_matrix_new), axis=0)
         logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2])) 
+                    format(sim_feature.shape[0], sim_feature.shape[1], sim_feature.shape[2])) 
+
+        ############################################sim_matrix
+        logger.info("before reshape, sim matrix size: {} x {}".format(sim_all.shape[0], sim_all.shape[1]))
+        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
+        sim_all_new = []
+        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+            sim_matrix_new.append(torch.cat((sim_all[s_:e_].to(device),
+                                                  torch.full((max_length-e_+s_, sim_all.shape[1]), -float('inf')).to(device)), axis=0))
+        sim_all = torch.stack(tuple(sim_matrix_new), axis=0)
+        logger.info("after reshape, sim matrix size: {} x {} x {}".
+                    format(sim_all.shape[0], sim_all.shape[1], sim_all.shape[2])) 
+        #####################################################
         tv_metrics_sim_feature, _ = compute_metrics(sim_feature)
         vt_metrics_sim_feature, _ = compute_metrics(sim_feature.T)
-
-        tv_metrics_sim_cluster, _ = compute_metrics(sim_cluster)
-        vt_metrics_sim_cluster, _ = compute_metrics(sim_cluster.T)
 
         tv_metrics_sim_all, _ = compute_metrics(sim_all)
         vt_metrics_sim_all, _ = compute_metrics(sim_all.T)       
@@ -481,11 +495,12 @@ def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, devic
         if args.local_rank == 0:
             text_features_ = torch.cat(text_features_list, dim=0)
             video_features_ = torch.cat(video_features_list, dim=0)
-            concatenated_features = torch.cat((text_features_, video_features_), dim=1)
-            pooled_features = F.adaptive_avg_pool1d(concatenated_features.unsqueeze(1), 512).squeeze(1)
+            # concatenated_features = torch.cat((text_features_, video_features_), dim=1)
+            # pooled_features = F.adaptive_avg_pool1d(concatenated_features.unsqueeze(1), 512).squeeze(1)
+            concatenated_features = torch.cat((text_features_, video_features_), dim=0)
             print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
             cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
-                data=pooled_features.T.cpu().numpy(),
+                data=concatenated_features.T.cpu().numpy(),
                 c=args.num_clusters,
                 m=args.fuzzy_index, 
                 error=0.0001,
@@ -584,14 +599,14 @@ def main():
         
         
         ##########   这里可能不需要事先提取聚类中心了
-        # if args.extract_feature:
-        #     v_prototype, t_prototype=load_cluster_centers(args)
-        #     if isinstance(v_prototype, np.ndarray):  
-        #         v_prototype = torch.from_numpy(v_prototype)
-        #     if isinstance(t_prototype, np.ndarray):   
-        #         t_prototype = torch.from_numpy(t_prototype)
-        #     extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, 9 , args, name='membership_contours_eval')
-        #     exit()
+        if args.extract_feature:
+            v_prototype, t_prototype=load_cluster_centers(args,0)
+            if isinstance(v_prototype, np.ndarray):  
+                v_prototype = torch.from_numpy(v_prototype)
+            if isinstance(t_prototype, np.ndarray):   
+                t_prototype = torch.from_numpy(t_prototype)
+            extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, -1 , args, name='membership_contours_eval')
+            exit()
 
         best_score = 0.00001
         best_output_model_file = "None"
