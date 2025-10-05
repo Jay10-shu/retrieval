@@ -4,7 +4,7 @@ from __future__ import print_function
 
 import logging
 import numpy as np
-
+import torch.nn.functional as F
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
@@ -14,7 +14,8 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 
 from modules.module_clip import CLIP, convert_weights
 from modules.modeling import CLIP4ClipPreTrainedModel, show_log, update_attr, check_attr
-from modules.criterion import JSDivergence
+from modules.criterion1 import JSDivergence
+from modules.edl_criterion import edl_classification_loss, dirichlet_kl_divergence_align
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 device = torch.device("cuda")
@@ -175,19 +176,25 @@ class DLAR(CLIP4ClipPreTrainedModel):
             feature_loss1 = self.loss_fct(fearture_matrix)
             feature_loss2 = self.loss_fct(fearture_matrix.T)
             feature_loss = (feature_loss1 + feature_loss2) / 2
+            CLUSTER_LOSS_WEIGHT = 0.03
             # # ******************JSD******************
-            if epoch <= 0:
+            if epoch <= 2:
                 # print('Train。。。。。。。。。。。。。。 ONLY SIM_feature epoch:',epoch)
                 loss_jsd_all +=  self.lambda1 * feature_loss
                 loss_set = {'feature_loss': feature_loss, 
-                            'cluster_loss_jsd': 0}
+                            'cluster_loss_jsd': 0.0
+                            }
             else:
+                # print('-----')
+                # warmup_factor = min(1.0, 0.5 * (epoch - 2))
+                # lambda_cluster = CLUSTER_LOSS_WEIGHT * warmup_factor
                 # print('Train。。。。。。。。。。。。。。 SIM_all epoch:',epoch)
-                Sim_JSD = self.JSD(ret['v_alpha'],ret['t_alpha'])
-                cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
-                cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
-                cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
+                cluster_loss_jsd = self.JSD(ret['v_alpha'],ret['t_alpha'])
+                # cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
+                # cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
+                # cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
                 loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+                # loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
                 loss_set = {'feature_loss': feature_loss, 
                             'cluster_loss_jsd': cluster_loss_jsd}
             return loss_jsd_all, loss_set, video_output, sentence_output
@@ -388,12 +395,15 @@ class DLAR(CLIP4ClipPreTrainedModel):
             sentence_output = allgather(sentence_output, self.task_config)
             word_features = allgather(word_features, self.task_config)
             torch.distributed.barrier()
-        v_prototype = v_prototype / v_prototype.norm(dim=-1,keepdim=True)
-        t_prototype = t_prototype / t_prototype.norm(dim=-1,keepdim=True)
+        # v_prototype = v_prototype / v_prototype.norm(dim=-1,keepdim=True)
+        # t_prototype = t_prototype / t_prototype.norm(dim=-1,keepdim=True)
         v_prototype = v_prototype.to(video_output.device)
         t_prototype = t_prototype.to(sentence_output.device)
-        vhub_logits =  logit_scale *  torch.matmul(video_output.float(), v_prototype.float().t())
-        thub_logits =  logit_scale *  torch.matmul(sentence_output.float(), t_prototype.float().t())
+        vhub_logits =  logit_scale *  torch.matmul(video_output.float(), v_prototype.float().t())  
+        vhub_logits = torch.cat([video_output,vhub_logits], dim=1)  
+        # print(vhub_logits)
+        thub_logits =  logit_scale *  torch.matmul(sentence_output.float(), t_prototype.float().t()) 
+        thub_logits = torch.cat([sentence_output,thub_logits], dim=1)
         v_alpha = self.evidence_compute(vhub_logits)
         t_alpha= self.evidence_compute(thub_logits)
         # print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',t_alpha)
@@ -404,7 +414,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
         ret['t_alpha'] = t_alpha
         ret['vhub_logits'] = vhub_logits
         ret['thub_logits'] = thub_logits
-        logits = (video_sentence_logits + sentence_frame_logits) / 2
+        logits = (video_sentence_logits + sentence_frame_logits) / 2  ## 结果 logits 维度: [文本数, 视频数]
         return logits, ret, video_output, sentence_output
 
     def _cross_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
@@ -467,9 +477,10 @@ class DLAR(CLIP4ClipPreTrainedModel):
         return retrieve_logits, frame_logits, contrastive_direction, video_output, sentence_output
 
     def evidence_compute(self, pos):
-        E = torch.exp(pos / self.tau)
-        alpha = E + 1
-        return alpha
+        # E = torch.exp(pos / self.tau)
+        # alpha = E + 1
+        # return alpha
+        return F.softplus(pos / self.tau) + 1.0
 
 
     
