@@ -18,7 +18,7 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port $MASTER_PORT
     --freeze_layer_num 0  --slice_framepos 2 \
     --tau 20 --lambda1 1 --lambda2 1 \
     --loose_type --linear_patch 2d --sim_header seqTransf \
-    --num_clusters 15 \
+    --num_clusters 50 \
     --fuzzy_index 1.1 \
     # --extract_feature \
 
