@@ -492,9 +492,6 @@ class DLAR(CLIP4ClipPreTrainedModel):
         return retrieve_logits, frame_logits, contrastive_direction, video_output, sentence_output
 
     def evidence_compute(self, pos):
-        # E = torch.exp(pos / self.tau)
-        # alpha = E + 1
-        # return alpha
         return F.softplus(pos / self.tau) + 1.0
 
 
