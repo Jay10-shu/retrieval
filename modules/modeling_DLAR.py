@@ -185,18 +185,33 @@ class DLAR(CLIP4ClipPreTrainedModel):
                             'cluster_loss_jsd': 0.0
                             }
             else:
-                # print('-----')
-                # warmup_factor = min(1.0, 0.5 * (epoch - 2))
-                # lambda_cluster = CLUSTER_LOSS_WEIGHT * warmup_factor
-                # print('Train。。。。。。。。。。。。。。 SIM_all epoch:',epoch)
-                cluster_loss_jsd = self.JSD(ret['v_alpha'],ret['t_alpha'])
-                # cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
-                # cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
-                # cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
-                loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
-                # loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+                 # 1. 从ret中获取狄利克雷分布的alpha参数
+                v_alpha = ret['v_alpha']
+                t_alpha = ret['t_alpha']
+                # 2. 定义计算两个狄利克雷分布之间KL散度的函数
+                def kl_divergence_dirichlet(alpha, beta):
+                    beta = beta.to(alpha.device)
+                    sum_alpha = torch.sum(alpha, dim=1)
+                    sum_beta = torch.sum(beta, dim=1)
+                    # KL散度计算公式
+                    term1 = torch.lgamma(sum_alpha) - torch.lgamma(sum_beta)
+                    term2 = torch.sum(torch.lgamma(beta) - torch.lgamma(alpha), dim=1)               
+                    alpha_minus_beta = alpha - beta
+                    digamma_alpha = torch.digamma(alpha)
+                    digamma_sum_alpha = torch.digamma(sum_alpha).unsqueeze(1).expand_as(alpha)   
+                    term3 = torch.sum(alpha_minus_beta * (digamma_alpha - digamma_sum_alpha), dim=1)               
+                    return term1 + term2 + term3
+                # 3. 计算“对齐”损失
+                # 我们假设batch内的视频和文本是一一对应的  计算 KL(视频分布 || 文本分布)  .detach() 确保监督信号是单向的
+                loss_v_align = kl_divergence_dirichlet(v_alpha, t_alpha.detach()).mean()
+                # 计算 KL(文本分布 || 视频分布)
+                loss_t_align = kl_divergence_dirichlet(t_alpha, v_alpha.detach()).mean()
+                # 4. 将两者平均，得到新的、基于狄利克雷分布的聚类损失
+                cluster_loss = (loss_v_align + loss_t_align) / 2
+                # 5. 合并总损失
+                loss_jsd_all = self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
                 loss_set = {'feature_loss': feature_loss, 
-                            'cluster_loss_jsd': cluster_loss_jsd}
+                            'cluster_loss_jsd': cluster_loss}
             return loss_jsd_all, loss_set, video_output, sentence_output
         else:  
             visual_output, sentence_output = self.mini_batch_output(sequence_output, seq_features, visual_output, attention_mask, video_mask, sim_header="meanP")
