@@ -227,7 +227,7 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
-    if epoch <= 2:  
+    if epoch <= 1:  
         print(f'load zero prototype {epoch}') 
         v_prototype = torch.zeros(args.num_clusters, 512)
         t_prototype = torch.zeros(args.num_clusters, 512)
@@ -268,7 +268,7 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
     total_loss = total_loss / len(train_dataloader)
-    if epoch != args.epochs - 1 and epoch !=0 and epoch !=1:
+    if epoch != args.epochs - 1 and epoch !=0 :
         extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, epoch, args, name=f'membership_contours_{epoch}')
     return total_loss, global_step
 
@@ -361,7 +361,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # ----------------------------------
         # 2. calculate the similarity
         # ----------------------------------
-        if epoch <= 2:
+        if epoch <= 1:
             # print('Test................................... ONLY SIM_feature epoch:',epoch)
             sim_feature, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
@@ -469,10 +469,6 @@ def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, devic
     model.eval()
     text_features_list = []
     video_features_list = []
-    # if args.local_rank == 0:
-    #     save_path = f"./log-{args.datatype}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
-    #     os.makedirs(save_path, exist_ok=True)
-    #     print(f"[Rank {args.local_rank}] Save path created: {save_path}")
     if args.n_gpu > 1:
         torch.distributed.barrier()
         print(f"[Rank {args.local_rank}] Passed initial barrier.")
@@ -634,21 +630,6 @@ def main():
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
-                # cluster_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}.pt')
-                # if os.path.exists(cluster_path):
-                #     os.remove(cluster_path)
-                #     print(f"{cluster_path} remove")
-                # else:
-                #     print(f"{cluster_path} not")
-                ##############################
-                # if epoch <= 0:
-                #     continue
-                # else:
-                #     cluster_epoch_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch}.pt')
-                #     clusters_epoch_center=torch.load(cluster_epoch_path)
-                #     logger.info(f"eval_epoch fininsh load: {cluster_epoch_path}")
-                #     torch.save(clusters_epoch_center, cluster_path)
-                #     logger.info(f"fininsh Cluster centers saved to: {cluster_path}")
     elif args.do_eval:
         if args.local_rank == 0:
             model.eval() 
