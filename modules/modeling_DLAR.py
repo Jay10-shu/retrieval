@@ -147,8 +147,6 @@ class DLAR(CLIP4ClipPreTrainedModel):
         self.use_original_clip_for_frame_features = True   
         self.apply(self.init_weights)
         self.loss_fct = CrossEn()
-        self.loss_dis = CrossEn()
-        self.JSD = JSDivergence()
         self.apply(self.init_weights)
         self.to(device)
         
@@ -178,7 +176,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
             feature_loss = (feature_loss1 + feature_loss2) / 2
             CLUSTER_LOSS_WEIGHT = 0.03
             # # ******************JSD******************
-            if epoch <= 2:
+            if epoch <= 1:
                 # print('Train。。。。。。。。。。。。。。 ONLY SIM_feature epoch:',epoch)
                 loss_jsd_all +=  self.lambda1 * feature_loss
                 loss_set = {'feature_loss': feature_loss, 
