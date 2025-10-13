@@ -21,6 +21,27 @@ allgather = AllGather.apply
 device = torch.device("cuda")
 
 
+class AutomaticWeightedLoss(nn.Module):
+    """
+    使用不确定性自动学习多个损失的权重
+    有两个损失项 (feature_loss, cluster_loss)
+    """
+    def __init__(self, num_losses=2):
+        super(AutomaticWeightedLoss, self).__init__()
+        # 学习方差的对数，数值上更稳定
+        self.params = nn.Parameter(torch.zeros(num_losses))
+
+    def forward(self, loss1, loss2):
+        # 权重 precision = exp(-log_var)
+        precision1 = torch.exp(-self.params[0])
+        weighted_loss1 = precision1 * loss1 + self.params[0]
+
+        precision2 = torch.exp(-self.params[1])
+        weighted_loss2 = precision2 * loss2 + self.params[1]
+        
+        return weighted_loss1 + weighted_loss2
+
+
 class DLAR(CLIP4ClipPreTrainedModel):
     def __init__(self, cross_config, clip_state_dict, task_config):
         super(DLAR, self).__init__(cross_config)
@@ -28,8 +49,13 @@ class DLAR(CLIP4ClipPreTrainedModel):
         self.ignore_video_index = -1
         self.tau = self.task_config.tau
         self.num_clusters = self.task_config.num_clusters  
+
+        self.loss_balancer = AutomaticWeightedLoss()
         self.lambda1 = self.task_config.lambda1
         self.lambda2 = self.task_config.lambda2
+
+        self.relu = nn.ReLU(inplace=True)
+        self.softplus = nn.Softplus()
         assert self.task_config.max_words + self.task_config.max_frames <= cross_config.max_position_embeddings
         self._stage_one = True
         self._stage_two = False
@@ -147,11 +173,13 @@ class DLAR(CLIP4ClipPreTrainedModel):
         self.use_original_clip_for_frame_features = True   
         self.apply(self.init_weights)
         self.loss_fct = CrossEn()
+        # self.loss_dis = CrossEn()
+        # self.JSD = JSDivergence()
         self.apply(self.init_weights)
         self.to(device)
         
 
-    def forward(self, epoch, input_ids, token_type_ids, attention_mask, video, v_prototype, t_prototype, video_mask=None):
+    def forward(self, epoch, input_ids, token_type_ids, attention_mask, video, prototype, video_mask=None):
                 
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
@@ -170,28 +198,53 @@ class DLAR(CLIP4ClipPreTrainedModel):
         if self.training:
             loss_jsd_all=0.
             fearture_matrix, ret, *_tmp, video_output, sentence_output = self.get_similarity_logits(sequence_output, seq_features, visual_output, attention_mask, 
-                                        video_mask, v_prototype, t_prototype, shaped=True, loose_type=self.loose_type)
+                                        video_mask, prototype, shaped=True, loose_type=self.loose_type)
             feature_loss1 = self.loss_fct(fearture_matrix)
             feature_loss2 = self.loss_fct(fearture_matrix.T)
             feature_loss = (feature_loss1 + feature_loss2) / 2
-            CLUSTER_LOSS_WEIGHT = 0.03
+            # CLUSTER_LOSS_WEIGHT = 0.03
             # # ******************JSD******************
             if epoch <= 1:
-                # print('Train。。。。。。。。。。。。。。 ONLY SIM_feature epoch:',epoch)
-                loss_jsd_all +=  self.lambda1 * feature_loss
+                loss_jsd_all +=  feature_loss
                 loss_set = {'feature_loss': feature_loss, 
                             'cluster_loss_jsd': 0.0
                             }
+                
+            # else:
+            #     # print('-----')
+            #     # warmup_factor = min(1.0, 0.5 * (epoch - 2))
+            #     # lambda_cluster = CLUSTER_LOSS_WEIGHT * warmup_factor
+            #     # print('Train。。。。。。。。。。。。。。 SIM_all epoch:',epoch)
+            #     cluster_loss_jsd = self.JSD(ret['v_alpha'],ret['t_alpha'])
+            #     # cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
+            #     # cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
+            #     # cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
+            #     loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+            #     # loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+            #     loss_set = {'feature_loss': feature_loss, 
+            #                 'cluster_loss_jsd': cluster_loss_jsd}
+                
+
+            # else:
+            #     vhub_logits = ret['vhub_logits']
+            #     thub_logits = ret['thub_logits']
+            #     soft_text_labels = torch.softmax(thub_logits, dim=1).detach()
+            #     loss_v_align = -torch.sum(soft_text_labels * torch.log_softmax(vhub_logits, dim=1), dim=1).mean()
+            #     soft_video_labels = torch.softmax(vhub_logits, dim=1).detach()
+            #     loss_t_align = -torch.sum(soft_video_labels * torch.log_softmax(thub_logits, dim=1), dim=1).mean()
+            #     cluster_loss = (loss_v_align + loss_t_align) / 2
+            #     loss_jsd_all += self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
+            #     loss_set = {'feature_loss': feature_loss, 
+            #                 'cluster_loss_jsd': cluster_loss}
+                
             else:
-                 # 1. 从ret中获取狄利克雷分布的alpha参数
                 v_alpha = ret['v_alpha']
                 t_alpha = ret['t_alpha']
-                # 2. 定义计算两个狄利克雷分布之间KL散度的函数
+                #  
                 def kl_divergence_dirichlet(alpha, beta):
                     beta = beta.to(alpha.device)
                     sum_alpha = torch.sum(alpha, dim=1)
                     sum_beta = torch.sum(beta, dim=1)
-                    # KL散度计算公式
                     term1 = torch.lgamma(sum_alpha) - torch.lgamma(sum_beta)
                     term2 = torch.sum(torch.lgamma(beta) - torch.lgamma(alpha), dim=1)               
                     alpha_minus_beta = alpha - beta
@@ -199,17 +252,31 @@ class DLAR(CLIP4ClipPreTrainedModel):
                     digamma_sum_alpha = torch.digamma(sum_alpha).unsqueeze(1).expand_as(alpha)   
                     term3 = torch.sum(alpha_minus_beta * (digamma_alpha - digamma_sum_alpha), dim=1)               
                     return term1 + term2 + term3
-                # 3. 计算“对齐”损失
-                # 我们假设batch内的视频和文本是一一对应的  计算 KL(视频分布 || 文本分布)  .detach() 确保监督信号是单向的
+
                 loss_v_align = kl_divergence_dirichlet(v_alpha, t_alpha.detach()).mean()
-                # 计算 KL(文本分布 || 视频分布)
                 loss_t_align = kl_divergence_dirichlet(t_alpha, v_alpha.detach()).mean()
-                # 4. 将两者平均，得到新的、基于狄利克雷分布的聚类损失
                 cluster_loss = (loss_v_align + loss_t_align) / 2
-                # 5. 合并总损失
-                loss_jsd_all = self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
+                # loss_jsd_all = self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
+                loss_jsd_all = self.loss_balancer(feature_loss, cluster_loss)
                 loss_set = {'feature_loss': feature_loss, 
                             'cluster_loss_jsd': cluster_loss}
+                
+            # else:
+            #     v_alpha = ret['v_alpha']
+            #     t_alpha = ret['t_alpha']
+            #     v_alpha_norm = torch.nn.functional.normalize(v_alpha, p=2, dim=1)
+            #     t_alpha_norm = torch.nn.functional.normalize(t_alpha, p=2, dim=1)
+            #     #    (BatchSize, NumClusters) x (NumClusters, BatchSize) -> (BatchSize, BatchSize)
+            #     sim_matrix_cluster = torch.matmul(v_alpha_norm, t_alpha_norm.t())
+            #     sim_matrix_cluster = sim_matrix_cluster / 0.1
+            #     # labels = torch.arange(sim_matrix_cluster.size(0)).to(sim_matrix_cluster.device)
+            #     # 5. Compute the symmetric InfoNCE loss using standard CrossEntropy.
+            #     loss_v2t = self.loss_dis(sim_matrix_cluster)         # Video-to-Text loss
+            #     loss_t2v = self.loss_dis(sim_matrix_cluster.t())   # Text-to-Video loss
+            #     cluster_loss = (loss_v2t + loss_t2v) / 2
+            #     loss_jsd_all = self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
+            #     loss_set = {'feature_loss': feature_loss, 
+            #                  'cluster_loss_jsd': cluster_loss}
             return loss_jsd_all, loss_set, video_output, sentence_output
         else:  
             visual_output, sentence_output = self.mini_batch_output(sequence_output, seq_features, visual_output, attention_mask, video_mask, sim_header="meanP")
@@ -348,7 +415,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
 
         return text_out, video_out
 
-    def _loose_similarity(self, sequence_output, seq_features, visual_output, attention_mask, video_mask, v_prototype, t_prototype,sim_header="meanP"):
+    def _loose_similarity(self, sequence_output, seq_features, visual_output, attention_mask, video_mask, prototype,sim_header="meanP"):
         """
             sequence_output: CLS token of text       # [bs, 1, dim]
             seq_features: all tokens of text         # [bs, num_words, dim]
@@ -408,26 +475,21 @@ class DLAR(CLIP4ClipPreTrainedModel):
             sentence_output = allgather(sentence_output, self.task_config)
             word_features = allgather(word_features, self.task_config)
             torch.distributed.barrier()
-        # v_prototype = v_prototype / v_prototype.norm(dim=-1,keepdim=True)
-        # t_prototype = t_prototype / t_prototype.norm(dim=-1,keepdim=True)
-        v_prototype = v_prototype.to(video_output.device)
-        t_prototype = t_prototype.to(sentence_output.device)
-        vhub_logits =  logit_scale *  torch.matmul(video_output.float(), v_prototype.float().t())  
-        vhub_logits = torch.cat([video_output,vhub_logits], dim=1)  
-        # print(vhub_logits)
-        thub_logits =  logit_scale *  torch.matmul(sentence_output.float(), t_prototype.float().t()) 
-        thub_logits = torch.cat([sentence_output,thub_logits], dim=1)
+        prototype = prototype.to(video_output.device)
+        vhub_logits =  logit_scale *  torch.matmul(video_output.float(), prototype.float().t())  
+        thub_logits =  logit_scale *  torch.matmul(sentence_output.float(), prototype.float().t()) 
         v_alpha = self.evidence_compute(vhub_logits)
         t_alpha= self.evidence_compute(thub_logits)
-        # print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',t_alpha)
         video_sentence_logits    = logit_scale * torch.matmul(sentence_output, video_output.t())
         sentence_frame_logits    = logit_scale * torch.matmul(sentence_output, frame_features.permute(0, 2, 1)).max(-1).values.t()
+        logits = (video_sentence_logits + sentence_frame_logits) / 2  #[文本数, 视频数]
         ret = {}
         ret['v_alpha'] = v_alpha
         ret['t_alpha'] = t_alpha
-        ret['vhub_logits'] = vhub_logits
-        ret['thub_logits'] = thub_logits
-        logits = (video_sentence_logits + sentence_frame_logits) / 2  ## 结果 logits 维度: [文本数, 视频数]
+        # ret['frame'] = sentence_allframe_logits
+        # ret['vhub_logits'] = vhub_logits
+        # ret['thub_logits'] = thub_logits
+
         return logits, ret, video_output, sentence_output
 
     def _cross_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
@@ -473,7 +535,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
         retrieve_logits = torch.cat(retrieve_logits_list, dim=0)
         return retrieve_logits
 
-    def get_similarity_logits(self, sequence_output, seq_features, visual_output, attention_mask, video_mask, v_prototype, t_prototype,shaped=False, loose_type=False):
+    def get_similarity_logits(self, sequence_output, seq_features, visual_output, attention_mask, video_mask, prototype,shaped=False, loose_type=False):
         if shaped is False:
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
@@ -482,7 +544,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
         frame_logits = None
         if loose_type:
             assert self.sim_header in ["meanP", "seqLSTM", "seqTransf"]
-            retrieve_logits, frame_logits, video_output, sentence_output = self._loose_similarity(sequence_output, seq_features, visual_output, attention_mask, video_mask, v_prototype, t_prototype, sim_header=self.sim_header)
+            retrieve_logits, frame_logits, video_output, sentence_output = self._loose_similarity(sequence_output, seq_features, visual_output, attention_mask, video_mask, prototype, sim_header=self.sim_header)
         else:
             assert self.sim_header in ["tightTransf"]
             retrieve_logits = self._cross_similarity(sequence_output, visual_output, attention_mask, video_mask, )
@@ -490,7 +552,12 @@ class DLAR(CLIP4ClipPreTrainedModel):
         return retrieve_logits, frame_logits, contrastive_direction, video_output, sentence_output
 
     def evidence_compute(self, pos):
-        return F.softplus(pos / self.tau) + 1.0
+        # E = torch.exp(pos / self.tau)
+        # E = self.relu(pos/ self.tau))
+        E = self.softplus(pos/ self.tau)
+        alpha = E + 1
+        return alpha
+
 
 
     
