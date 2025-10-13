@@ -22,10 +22,6 @@ device = torch.device("cuda")
 
 
 class AutomaticWeightedLoss(nn.Module):
-    """
-    使用不确定性自动学习多个损失的权重
-    有两个损失项 (feature_loss, cluster_loss)
-    """
     def __init__(self, num_losses=2):
         super(AutomaticWeightedLoss, self).__init__()
         # 学习方差的对数，数值上更稳定
@@ -209,33 +205,6 @@ class DLAR(CLIP4ClipPreTrainedModel):
                 loss_set = {'feature_loss': feature_loss, 
                             'cluster_loss_jsd': 0.0
                             }
-                
-            # else:
-            #     # print('-----')
-            #     # warmup_factor = min(1.0, 0.5 * (epoch - 2))
-            #     # lambda_cluster = CLUSTER_LOSS_WEIGHT * warmup_factor
-            #     # print('Train。。。。。。。。。。。。。。 SIM_all epoch:',epoch)
-            #     cluster_loss_jsd = self.JSD(ret['v_alpha'],ret['t_alpha'])
-            #     # cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
-            #     # cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
-            #     # cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
-            #     loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
-            #     # loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
-            #     loss_set = {'feature_loss': feature_loss, 
-            #                 'cluster_loss_jsd': cluster_loss_jsd}
-                
-
-            # else:
-            #     vhub_logits = ret['vhub_logits']
-            #     thub_logits = ret['thub_logits']
-            #     soft_text_labels = torch.softmax(thub_logits, dim=1).detach()
-            #     loss_v_align = -torch.sum(soft_text_labels * torch.log_softmax(vhub_logits, dim=1), dim=1).mean()
-            #     soft_video_labels = torch.softmax(vhub_logits, dim=1).detach()
-            #     loss_t_align = -torch.sum(soft_video_labels * torch.log_softmax(thub_logits, dim=1), dim=1).mean()
-            #     cluster_loss = (loss_v_align + loss_t_align) / 2
-            #     loss_jsd_all += self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
-            #     loss_set = {'feature_loss': feature_loss, 
-            #                 'cluster_loss_jsd': cluster_loss}
                 
             else:
                 v_alpha = ret['v_alpha']
