@@ -7,9 +7,9 @@ import torch
 import numpy as np
 import random
 import os
-import copy
-from tqdm import tqdm
-from metrics_cluster1 import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim,clusterSim_jsd
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.cluster import KMeans # <--- 添加这一行
+from metrics_cluster1 import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, clusterSim_jsd, kl_divergence_matrix,cluster_similarity_cosine
 import time
 import argparse
 from datetime import timedelta
@@ -17,12 +17,10 @@ from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling_DLAR1 import DLAR
 from modules.optimization import BertAdam
-from scipy.optimize import minimize
+# from scipy.optimize import minimize
 import torch.nn.functional as F
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
-import tqdm
-from sklearn.cluster import KMeans
 import skfuzzy as fuzz
 torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=4000))
 global logger
@@ -220,7 +218,7 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model = None
     return model
 
-def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0):
+def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0, writer=None):
     global logger
     torch.cuda.empty_cache()
     model.train()
@@ -229,19 +227,17 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
     total_loss = 0
     if epoch <= 1:  
         print(f'load zero prototype {epoch}') 
-        v_prototype = torch.zeros(args.num_clusters, 512)
-        t_prototype = torch.zeros(args.num_clusters, 512)
+        prototype = torch.zeros(args.num_clusters, 512)
     else:
         print(f'load non-zero prototype {epoch}')  
-        v_prototype, t_prototype=load_cluster_centers(args, epoch)
-        if isinstance(v_prototype, np.ndarray):  
-            v_prototype = torch.from_numpy(v_prototype)
-        if isinstance(t_prototype, np.ndarray):   
-            t_prototype = torch.from_numpy(t_prototype)
+        prototype=load_cluster_centers(args, epoch)
+        if isinstance(prototype, np.ndarray):  
+            prototype = torch.from_numpy(prototype)
+
 
     for step, batch in enumerate(train_dataloader):
         input_ids, input_mask, segment_ids, video, video_mask = batch
-        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, v_prototype.detach(), t_prototype.detach(), video_mask)
+        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, prototype.detach(), video_mask)
         if n_gpu > 1:
             loss = loss.mean()
         if args.gradient_accumulation_steps > 1:
@@ -267,12 +263,21 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
                             float(loss), float(loss_set['feature_loss']),  float(loss_set['cluster_loss_jsd']),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
+
+                if writer is not None:
+                    writer.add_scalar('Loss/Total_Loss', float(loss), global_step)
+                    writer.add_scalar('Loss/Feature_Loss', float(loss_set['feature_loss']), global_step)
+                    writer.add_scalar('Loss/Cluster_Loss_JSD', float(loss_set['cluster_loss_jsd']), global_step)
+                    current_lr = sorted(list(set(optimizer.get_lr())))[0] # 取第一个学习率作为代表
+                    writer.add_scalar('Learning_Rate/main_lr', current_lr, global_step)
+                    writer.flush() 
+                start_time = time.time()
     total_loss = total_loss / len(train_dataloader)
     if epoch != args.epochs - 1 and epoch !=0 :
-        extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, epoch, args, name=f'membership_contours_{epoch}')
+        extract_clip_features_dist(model, train_dataloader,prototype, device, epoch, args, name=f'membership_contours_{epoch}')
     return total_loss, global_step
 
-def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype):
+def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype):
     sim_feature_matrix = []
     Sim_cluster_matrix = []
     for idx1, b1 in enumerate(batch_list_t):
@@ -284,11 +289,13 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
         for idx2, b2 in enumerate(batch_list_v):
             video_mask, *_tmp = b2
             visual_output = batch_visual_output_list[idx2]
-            feature_logits, ret, _, _, _ = model.get_similarity_logits(sequence_output, seq_features, visual_output, input_mask, video_mask, v_prototype, t_prototype,
+            feature_logits, ret, _, _, _ = model.get_similarity_logits(sequence_output, seq_features, visual_output, input_mask, video_mask, prototype,
                                                                      loose_type=model.loose_type)
             feature_logits = feature_logits.detach()
             each_row_feature.append(feature_logits)
-            sim_cluster= clusterSim_jsd(ret['v_alpha'],ret['t_alpha']).detach()
+            # sim_cluster= clusterSim_jsd(ret['v_alpha'],ret['t_alpha']).detach()
+            sim_cluster = kl_divergence_matrix(ret['v_alpha'], ret['t_alpha']).detach()
+            # sim_cluster = cluster_similarity_cosine(ret['v_alpha'], ret['t_alpha']).detach()
             each_row_cluster.append(sim_cluster)
         each_row_feature = torch.cat(tuple(each_row_feature), axis=-1)
         sim_feature_matrix.append(each_row_feature)
@@ -325,13 +332,10 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # ----------------------------
         # 1. cache the features
         # ----------------------------
-        print('eval:load v_prototype and t_prototype')
-        v_prototype, t_prototype=load_cluster_centers(args,epoch)
-        if isinstance(v_prototype, np.ndarray):  
-            v_prototype = torch.from_numpy(v_prototype)
-        if isinstance(t_prototype, np.ndarray):   
-            t_prototype = torch.from_numpy(t_prototype)
-
+        print('eval:load prototype')
+        prototype = load_cluster_centers(args,epoch)
+        if isinstance(prototype, np.ndarray):  
+            prototype = torch.from_numpy(prototype)
         for bid, batch in enumerate(test_dataloader): # Maybe something went wrong here!!!
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
             input_ids, input_mask, segment_ids, video, video_mask = batch
@@ -363,16 +367,16 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # ----------------------------------
         if epoch <= 1:
             # print('Test................................... ONLY SIM_feature epoch:',epoch)
-            sim_feature, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype)
+            sim_feature, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
             sim_cluster = torch.zeros_like(sim_feature)
             sim_all = args.lambda1*sim_feature + args.lambda2*sim_cluster
         else:  
             # print('Test................................... SIM_all epoch:',epoch)
-            sim_feature, sim_cluster= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, v_prototype, t_prototype)
+            sim_feature, sim_cluster= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
             sim_cluster = torch.cat(tuple(sim_cluster), axis=0)
-            sim_all = args.lambda1*sim_feature + 0.1*sim_cluster
+            sim_all = args.lambda1*sim_feature + args.lambda2 *sim_cluster
 
 
 
@@ -465,7 +469,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
     R1 = tv_metrics_sim_all['R1']
     return R1
 
-def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, device, epoch, args, name):
+def extract_clip_features_dist(model, dataloader,prototype, device, epoch, args, name):
     model.eval()
     text_features_list = []
     video_features_list = []
@@ -476,7 +480,7 @@ def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, devic
         for batch_idx, batch in enumerate(dataloader):
             input_ids, input_mask, segment_ids, video, video_mask = batch
             text_features, video_features = model(
-                1, input_ids, segment_ids, input_mask, video, v_prototype, t_prototype, video_mask
+                1, input_ids, segment_ids, input_mask, video, prototype, video_mask
             )
             if args.n_gpu > 1:
                 gathered_text = [torch.zeros_like(text_features) for _ in range(torch.distributed.get_world_size())]
@@ -491,25 +495,26 @@ def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, devic
         if args.local_rank == 0:
             text_features_ = torch.cat(text_features_list, dim=0)
             video_features_ = torch.cat(video_features_list, dim=0)
-            # concatenated_features = torch.cat((text_features_, video_features_), dim=1)
-            # pooled_features = F.adaptive_avg_pool1d(concatenated_features.unsqueeze(1), 512).squeeze(1)
             concatenated_features = torch.cat((text_features_, video_features_), dim=0)
             print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
-            cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
-                data=concatenated_features.T.cpu().numpy(),
-                c=args.num_clusters,
-                m=args.fuzzy_index, 
-                error=0.0001,
-                maxiter=100000,
-                metric='cosine'
-            )       
+            # cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
+            #     data=concatenated_features.T.cpu().numpy(),
+            #     c=args.num_clusters,
+            #     m=args.fuzzy_index, 
+            #     error=0.0001,
+            #     maxiter=100000,
+            #     metric='cosine'
+            # )       
+            kmeans = KMeans(n_clusters=args.num_clusters, random_state=0, n_init=10)
+            kmeans.fit(concatenated_features)  # 先训练模型
+            cluster_centers = kmeans.cluster_centers_  # 获取 ndarray
             logger.info("fuzzy_index: %s", args.fuzzy_index)    
-            save_path = f"./log-{args.datatype}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
+            save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
             print(f"[Rank {args.local_rank}] Save path created: {save_path}")
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
-            membership_sums = membership_matrix.sum(axis=0)
-            is_valid = np.allclose(membership_sums, 1, atol=1e-6)
+            # membership_sums = membership_matrix.sum(axis=0)
+            # is_valid = np.allclose(membership_sums, 1, atol=1e-6)
             cluster_epoch_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch}.pt')
             torch.save(cluster_centers, cluster_epoch_path)
             logger.info(f"[Rank 0] Cluster centers saved to: {cluster_epoch_path}")
@@ -528,21 +533,23 @@ def extract_clip_features_dist(model, dataloader,v_prototype, t_prototype, devic
 def load_cluster_centers(args, epoch):
     import os
     epoch1 = epoch-1 
-    cluster_path = os.path.join(f'./log-{args.datatype}/cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch1}.pt') 
+    cluster_path = os.path.join(f'./{args.output_dir}/cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch1}.pt') 
     if os.path.exists(cluster_path):
-        v_prototype = torch.load(cluster_path)
-        t_prototype = torch.load(cluster_path)
+        prototype = torch.load(cluster_path)
+        prototype = torch.from_numpy(prototype)
+        prototype = F.normalize(prototype, p=2, dim=1)
         print(f'Cluster centers loaded from {cluster_path}')
     else:
         logger.warning("Cluster centers file not found at: %s", cluster_path)
-        v_prototype = torch.zeros(args.num_clusters, 512)
-        t_prototype = torch.zeros(args.num_clusters, 512)
-    return  v_prototype, t_prototype    
+        prototype = torch.zeros(args.num_clusters, 512)
+    return  prototype
 
 def main():
     global logger
     args = get_args()
     args = set_seed_logger(args)
+    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", time.strftime("%Y%m%d-%H%M%S")))
+
     device, n_gpu = init_device(args, args.local_rank)
     tokenizer = ClipTokenizer()
     assert args.task_type == "retrieval"
@@ -595,14 +602,12 @@ def main():
         
         
         ##########   这里可能不需要事先提取聚类中心了
-        if args.extract_feature:
-            v_prototype, t_prototype=load_cluster_centers(args,0)
-            if isinstance(v_prototype, np.ndarray):  
-                v_prototype = torch.from_numpy(v_prototype)
-            if isinstance(t_prototype, np.ndarray):   
-                t_prototype = torch.from_numpy(t_prototype)
-            extract_clip_features_dist(model, train_dataloader,v_prototype, t_prototype, device, -1 , args, name='membership_contours_eval')
-            exit()
+        # if args.extract_feature:
+        #     prototype=load_cluster_centers(args,0)
+        #     if isinstance(prototype, np.ndarray):  
+        #         prototype = torch.from_numpy(prototype)
+        #     extract_clip_features_dist(model, train_dataloader,prototype, device, -1 , args, name='membership_contours_eval')
+        #     exit()
 
         best_score = 0.00001
         best_output_model_file = "None"
@@ -617,7 +622,7 @@ def main():
             train_sampler.set_epoch(epoch)
             
             ########................................................................第一步 train...........................................
-            tr_loss, global_step = train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=args.local_rank)
+            tr_loss, global_step = train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=args.local_rank, writer=writer)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
@@ -630,9 +635,13 @@ def main():
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+
+
+        writer.close()
     elif args.do_eval:
         if args.local_rank == 0:
             model.eval() 
             eval_epoch(args, model, test_dataloader, device, n_gpu, args.eval_epoch)
+
 if __name__ == "__main__":
     main()
