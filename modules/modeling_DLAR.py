@@ -21,22 +21,6 @@ allgather = AllGather.apply
 device = torch.device("cuda")
 
 
-class AutomaticWeightedLoss(nn.Module):
-    def __init__(self, num_losses=2):
-        super(AutomaticWeightedLoss, self).__init__()
-        # 学习方差的对数，数值上更稳定
-        self.params = nn.Parameter(torch.zeros(num_losses))
-
-    def forward(self, loss1, loss2):
-        # 权重 precision = exp(-log_var)
-        precision1 = torch.exp(-self.params[0])
-        weighted_loss1 = precision1 * loss1 + self.params[0]
-
-        precision2 = torch.exp(-self.params[1])
-        weighted_loss2 = precision2 * loss2 + self.params[1]
-        
-        return weighted_loss1 + weighted_loss2
-
 
 class DLAR(CLIP4ClipPreTrainedModel):
     def __init__(self, cross_config, clip_state_dict, task_config):
@@ -46,7 +30,6 @@ class DLAR(CLIP4ClipPreTrainedModel):
         self.tau = self.task_config.tau
         self.num_clusters = self.task_config.num_clusters  
 
-        self.loss_balancer = AutomaticWeightedLoss()
         self.lambda1 = self.task_config.lambda1
         self.lambda2 = self.task_config.lambda2
 
@@ -175,8 +158,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
         self.to(device)
         
 
-    def forward(self, epoch, input_ids, token_type_ids, attention_mask, video, prototype, video_mask=None):
-                
+    def forward(self, epoch, input_ids, token_type_ids, attention_mask, video, prototype, video_mask=None, lambda2=0.0):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
         attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
@@ -206,6 +188,33 @@ class DLAR(CLIP4ClipPreTrainedModel):
                             'cluster_loss_jsd': 0.0
                             }
                 
+            # else:
+            #     # print('-----')
+            #     # warmup_factor = min(1.0, 0.5 * (epoch - 2))
+            #     # lambda_cluster = CLUSTER_LOSS_WEIGHT * warmup_factor
+            #     # print('Train。。。。。。。。。。。。。。 SIM_all epoch:',epoch)
+            #     cluster_loss_jsd = self.JSD(ret['v_alpha'],ret['t_alpha'])
+            #     # cluster_loss_jsd1 = self.loss_dis(Sim_JSD)
+            #     # cluster_loss_jsd2 = self.loss_dis(Sim_JSD.T)
+            #     # cluster_loss_jsd = (cluster_loss_jsd1 + cluster_loss_jsd2)/2 
+            #     loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+            #     # loss_jsd_all +=  self.lambda1 * feature_loss  +  self.lambda2 * cluster_loss_jsd 
+            #     loss_set = {'feature_loss': feature_loss, 
+            #                 'cluster_loss_jsd': cluster_loss_jsd}
+                
+
+            # else:
+            #     vhub_logits = ret['vhub_logits']
+            #     thub_logits = ret['thub_logits']
+            #     soft_text_labels = torch.softmax(thub_logits, dim=1).detach()
+            #     loss_v_align = -torch.sum(soft_text_labels * torch.log_softmax(vhub_logits, dim=1), dim=1).mean()
+            #     soft_video_labels = torch.softmax(vhub_logits, dim=1).detach()
+            #     loss_t_align = -torch.sum(soft_video_labels * torch.log_softmax(thub_logits, dim=1), dim=1).mean()
+            #     cluster_loss = (loss_v_align + loss_t_align) / 2
+            #     loss_jsd_all += self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
+            #     loss_set = {'feature_loss': feature_loss, 
+            #                 'cluster_loss_jsd': cluster_loss}
+                
             else:
                 v_alpha = ret['v_alpha']
                 t_alpha = ret['t_alpha']
@@ -225,8 +234,7 @@ class DLAR(CLIP4ClipPreTrainedModel):
                 loss_v_align = kl_divergence_dirichlet(v_alpha, t_alpha.detach()).mean()
                 loss_t_align = kl_divergence_dirichlet(t_alpha, v_alpha.detach()).mean()
                 cluster_loss = (loss_v_align + loss_t_align) / 2
-                # loss_jsd_all = self.lambda1 * feature_loss + self.lambda2 * cluster_loss 
-                loss_jsd_all = self.loss_balancer(feature_loss, cluster_loss)
+                loss_jsd_all = self.lambda1 * feature_loss + lambda2 * cluster_loss 
                 loss_set = {'feature_loss': feature_loss, 
                             'cluster_loss_jsd': cluster_loss}
                 
