@@ -8,8 +8,8 @@ import numpy as np
 import random
 import os
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.cluster import KMeans # <--- 添加这一行
-from metrics_cluster1 import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, clusterSim_jsd, kl_divergence_matrix,cluster_similarity_cosine
+from sklearn.cluster import KMeans 
+from metrics_cluster1 import compute_metrics, kl_divergence_matrix
 import time
 import argparse
 from datetime import timedelta
@@ -21,6 +21,7 @@ from modules.optimization import BertAdam
 import torch.nn.functional as F
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
+from dataloaders.minicluster import gpu_kmeans_with_ninit, mini_batch_kmeans, mini_batch_fcm
 import skfuzzy as fuzz
 torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=4000))
 global logger
@@ -98,6 +99,12 @@ def get_args(description='DLAR on Retrieval Task'):
     parser.add_argument('--sim_header', type=str, default="meanP",
                         choices=["meanP", "seqLSTM", "seqTransf", "tightTransf"],
                         help="choice a similarity header.")
+    # ✅ 新增的模式
+    parser.add_argument("--do_recover", action='store_true',
+                        help="Run recovery (clustering and eval) for a specific epoch and then exit.")
+    # ✅ [新增] 指定要恢复的轮次，需与 --do_recover 配合使用
+    parser.add_argument('--recovery_epoch', type=int, default=-1,
+                        help="The epoch number to recover. MUST be used with --do_recover.")
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
     parser.add_argument('--extract_feature', action='store_true', help='if extract feature')
     parser.add_argument('--fuzzy_index', default=1.1, type=float, help='fcm')
@@ -110,8 +117,9 @@ def get_args(description='DLAR on Retrieval Task'):
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
             args.gradient_accumulation_steps))
-    if not args.do_train and not args.do_eval:
-        raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+    # ✅ [修改] 更新参数验证，加入新的 do_recover 模式
+    if not args.do_train and not args.do_eval and not args.do_recover:
+        raise ValueError("At least one of `do_train`, `do_eval`, or `do_recover` must be True.")
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
 
     return args
@@ -157,6 +165,7 @@ def init_device(args, local_rank):
 def init_model(args, device, n_gpu, local_rank):
     if args.init_model:
         model_state_dict = torch.load(args.init_model, map_location='cpu')
+        print(f'Successfully load {args.init_model}!!!')
     else:
         model_state_dict = None
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
@@ -218,14 +227,14 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model = None
     return model
 
-def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0, writer=None):
+def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0, writer=None, lambda2_weight=0.0):
     global logger
     torch.cuda.empty_cache()
     model.train()
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
-    if epoch <= 1:  
+    if epoch <= 1:   ## 0, 1, 2
         print(f'load zero prototype {epoch}') 
         prototype = torch.zeros(args.num_clusters, 512)
     else:
@@ -237,7 +246,7 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
 
     for step, batch in enumerate(train_dataloader):
         input_ids, input_mask, segment_ids, video, video_mask = batch
-        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, prototype.detach(), video_mask)
+        loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, prototype.detach(), video_mask, lambda2=lambda2_weight)
         if n_gpu > 1:
             loss = loss.mean()
         if args.gradient_accumulation_steps > 1:
@@ -273,35 +282,45 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
                     writer.flush() 
                 start_time = time.time()
     total_loss = total_loss / len(train_dataloader)
-    if epoch != args.epochs - 1 and epoch !=0 :
-        extract_clip_features_dist(model, train_dataloader,prototype, device, epoch, args, name=f'membership_contours_{epoch}')
+    # if epoch != args.epochs - 1 and epoch !=0 :
+        # extract_clip_features_dist(model, train_dataloader,prototype, device, epoch, args, name=f'membership_contours_{epoch}')
     return total_loss, global_step
+
 
 def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype):
     sim_feature_matrix = []
-    Sim_cluster_matrix = []
+    Sim_cluster_matrix_T2V = [] # 用于 T2V
+    Sim_cluster_matrix_V2T = [] # 用于 V2T (保持 M,N 形状)
     for idx1, b1 in enumerate(batch_list_t):
         input_mask, segment_ids, *_tmp = b1
         sequence_output = batch_sequence_output_list[idx1]
         seq_features = batch_seq_features_list[idx1]
         each_row_feature = []
-        each_row_cluster = []
+        each_row_cluster_t2v = []
+        each_row_cluster_v2t = []
         for idx2, b2 in enumerate(batch_list_v):
             video_mask, *_tmp = b2
             visual_output = batch_visual_output_list[idx2]
             feature_logits, ret, _, _, _ = model.get_similarity_logits(sequence_output, seq_features, visual_output, input_mask, video_mask, prototype,
-                                                                     loose_type=model.loose_type)
+                                                                      loose_type=model.loose_type)
             feature_logits = feature_logits.detach()
             each_row_feature.append(feature_logits)
-            # sim_cluster= clusterSim_jsd(ret['v_alpha'],ret['t_alpha']).detach()
-            sim_cluster = kl_divergence_matrix(ret['v_alpha'], ret['t_alpha']).detach()
-            # sim_cluster = cluster_similarity_cosine(ret['v_alpha'], ret['t_alpha']).detach()
-            each_row_cluster.append(sim_cluster)
+            sim_cluster_t2v, sim_cluster_v2t = kl_divergence_matrix(ret['v_alpha'], ret['t_alpha'])
+            each_row_cluster_t2v.append(sim_cluster_t2v.detach())
+            each_row_cluster_v2t.append(sim_cluster_v2t.detach())
+            
         each_row_feature = torch.cat(tuple(each_row_feature), axis=-1)
         sim_feature_matrix.append(each_row_feature)
-        each_row_cluster = torch.cat(tuple(each_row_cluster), axis=-1)
-        Sim_cluster_matrix.append(each_row_cluster)
-    return sim_feature_matrix, Sim_cluster_matrix
+        
+        each_row_cluster_t2v = torch.cat(tuple(each_row_cluster_t2v), axis=-1)
+        Sim_cluster_matrix_T2V.append(each_row_cluster_t2v)
+        
+        each_row_cluster_v2t = torch.cat(tuple(each_row_cluster_v2t), axis=-1)
+        Sim_cluster_matrix_V2T.append(each_row_cluster_v2t)
+
+    return sim_feature_matrix, Sim_cluster_matrix_T2V, Sim_cluster_matrix_V2T
+
+
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
     if hasattr(model, 'module'):
@@ -333,7 +352,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # 1. cache the features
         # ----------------------------
         print('eval:load prototype')
-        prototype = load_cluster_centers(args,epoch)
+        prototype = load_cluster_centers(args, epoch)
         if isinstance(prototype, np.ndarray):  
             prototype = torch.from_numpy(prototype)
         for bid, batch in enumerate(test_dataloader): # Maybe something went wrong here!!!
@@ -367,63 +386,60 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
         # ----------------------------------
         if epoch <= 1:
             # print('Test................................... ONLY SIM_feature epoch:',epoch)
-            sim_feature, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
+            sim_feature, _, _= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
             sim_feature = torch.cat(tuple(sim_feature), axis=0)
-            sim_cluster = torch.zeros_like(sim_feature)
-            sim_all = args.lambda1*sim_feature + args.lambda2*sim_cluster
+            sim_cluster_T2V = torch.zeros_like(sim_feature)
+            sim_cluster_V2T = torch.zeros_like(sim_feature)
+            # T2V 矩阵 -> [M, N]
+            sim_all_T2V = args.lambda1 * sim_feature + args.lambda2 * sim_cluster_T2V
+            # V2T 矩阵 -> [N, M]
+            sim_all_V2T = args.lambda1 * sim_feature.T + args.lambda2 * sim_cluster_V2T.T
         else:  
             # print('Test................................... SIM_all epoch:',epoch)
-            sim_feature, sim_cluster= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
-            sim_feature = torch.cat(tuple(sim_feature), axis=0)
-            sim_cluster = torch.cat(tuple(sim_cluster), axis=0)
-            sim_all = args.lambda1*sim_feature + args.lambda2 *sim_cluster
+            sim_feature, sim_cluster_T2V_list, sim_cluster_V2T_list= _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list, prototype)
+            sim_feature = torch.cat(tuple(sim_feature), axis=0).cpu().numpy()
+            sim_cluster_T2V = torch.cat(tuple(sim_cluster_T2V_list), axis=0).cpu().numpy()
+            sim_cluster_V2T = torch.cat(tuple(sim_cluster_V2T_list), axis=0).cpu().numpy()
+            # T2V 矩阵 -> [M, N]
+            sim_all_T2V = args.lambda1 * sim_feature + args.lambda2 * sim_cluster_T2V
+            # V2T 矩阵 -> [N, M] 
+            sim_all_V2T = args.lambda1 * sim_feature.T + args.lambda2 * sim_cluster_V2T.T
 
+    logger.info("sim matrix size: {}, {}".format(sim_feature.shape[0], sim_feature.shape[1]))
+    tv_metrics_sim_feature, _ = compute_metrics(sim_feature)
+    tv_metrics_sim_cluster, _ = compute_metrics(sim_cluster_T2V)
+    tv_metrics_sim_all, _ = compute_metrics(sim_all_T2V)
 
+    vt_metrics_sim_feature, _ = compute_metrics(sim_feature.T)
+    vt_metrics_sim_cluster, _ = compute_metrics(sim_cluster_V2T.T)
+    vt_metrics_sim_all, _ = compute_metrics(sim_all_V2T)    
+    def print_sim(name, sim):
+        # 确保在 CPU 上并转为 NumPy
+        if isinstance(sim, torch.Tensor):
+            sim_np = sim.detach().cpu().numpy()
+        else:
+            sim_np = sim  # 已是 NumPy
 
+        print(f"\n{'='*50}")
+        print(f"Matrix: {name}")
+        print(f"Shape: {sim_np.shape}")
+        print(f"Range: [{sim_np.min():.6f}, {sim_np.max():.6f}]")
+        print(f"Mean ± Std: {sim_np.mean():.6f} ± {sim_np.std():.6f}")
+        
+        # 打印左上角 3x5（文本数 x 视频数，通常不对称）
+        rows, cols = min(3, sim_np.shape[0]), min(5, sim_np.shape[1])
+        print(f"\nTop-left {rows}x{cols} values:")
+        print(sim_np[:rows, :cols]) 
+    print_sim("sim_feature (T2V)", sim_feature)
+    print_sim("sim_cluster_T2V", sim_cluster_T2V)
+    print_sim("sim_all_T2V", sim_all_T2V)
 
-    #####################################################
-    if multi_sentence_:
-        ############sim_feature
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_feature.shape[0], sim_feature.shape[1]))
-        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
-        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
-        sim_matrix_new = []
-        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            sim_matrix_new.append(torch.cat((sim_feature[s_:e_].to(device),
-                                                  torch.full((max_length-e_+s_, sim_feature.shape[1]), -float('inf')).to(device)), axis=0))
-        sim_feature = torch.stack(tuple(sim_matrix_new), axis=0)
-        logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(sim_feature.shape[0], sim_feature.shape[1], sim_feature.shape[2])) 
+    # --- 打印 V2T 相似度矩阵（即转置后的）---
+    print_sim("sim_feature.T (V2T)", sim_feature.T)
+    print_sim("sim_cluster_V2T.T", sim_cluster_V2T.T)   # 注意变量名是 V2T
+    print_sim("sim_all_V2T.T", sim_all_V2T.T)
 
-        ############################################sim_matrix
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_all.shape[0], sim_all.shape[1]))
-        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
-        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
-        sim_all_new = []
-        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            sim_matrix_new.append(torch.cat((sim_all[s_:e_].to(device),
-                                                  torch.full((max_length-e_+s_, sim_all.shape[1]), -float('inf')).to(device)), axis=0))
-        sim_all = torch.stack(tuple(sim_matrix_new), axis=0)
-        logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(sim_all.shape[0], sim_all.shape[1], sim_all.shape[2])) 
-        #####################################################
-        tv_metrics_sim_feature, _ = compute_metrics(sim_feature)
-        vt_metrics_sim_feature, _ = compute_metrics(sim_feature.T)
-
-        tv_metrics_sim_all, _ = compute_metrics(sim_all)
-        vt_metrics_sim_all, _ = compute_metrics(sim_all.T)       
-    else:
-        logger.info("sim matrix size: {}, {}".format(sim_feature.shape[0], sim_feature.shape[1]))
-        tv_metrics_sim_feature, _ = compute_metrics(sim_feature)
-        vt_metrics_sim_feature, _ = compute_metrics(sim_feature.T)
-
-        tv_metrics_sim_cluster, _ = compute_metrics(sim_cluster)
-        vt_metrics_sim_cluster, _ = compute_metrics(sim_cluster.T)
-
-        tv_metrics_sim_all, _ = compute_metrics(sim_all)
-        vt_metrics_sim_all, _ = compute_metrics(sim_all.T)
-        logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_feature), len(sim_feature[0])))
-    
+    logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_feature), len(sim_feature[0])))
     if multi_sentence_ == False:
         logger.info(f'\nT2V-feature-u:-{args.num_clusters}_{args.fuzzy_index}')
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
@@ -478,6 +494,7 @@ def extract_clip_features_dist(model, dataloader,prototype, device, epoch, args,
         print(f"[Rank {args.local_rank}] Passed initial barrier.")
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            batch = tuple(t.to(device, non_blocking=True) for t in batch)
             input_ids, input_mask, segment_ids, video, video_mask = batch
             text_features, video_features = model(
                 1, input_ids, segment_ids, input_mask, video, prototype, video_mask
@@ -496,18 +513,48 @@ def extract_clip_features_dist(model, dataloader,prototype, device, epoch, args,
             text_features_ = torch.cat(text_features_list, dim=0)
             video_features_ = torch.cat(video_features_list, dim=0)
             concatenated_features = torch.cat((text_features_, video_features_), dim=0)
-            print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
+            #<<<<<<<<<<<<<<<<<<<<<  Fuzzy >>>>>>>>>>>>>>>>>>>>
+            # print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
             # cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
             #     data=concatenated_features.T.cpu().numpy(),
             #     c=args.num_clusters,
             #     m=args.fuzzy_index, 
             #     error=0.0001,
-            #     maxiter=100000,
+            #     maxiter=100,
             #     metric='cosine'
-            # )       
-            kmeans = KMeans(n_clusters=args.num_clusters, random_state=0, n_init=10)
-            kmeans.fit(concatenated_features)  # 先训练模型
-            cluster_centers = kmeans.cluster_centers_  # 获取 ndarray
+            # )    
+            #<<<<<<<<<<<<<<<<<<<<<  MINI-Fuzzy >>>>>>>>>>>>>>>>>>>>
+            print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
+            cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
+            # <<<<<<<<<<<<<<<<<<<<<  MINI-Kmeans >>>>>>>>>>>>>>>>>>>>
+            # print("[Rank 0] Using mini-Kmeans clustering...", flush=True)
+            # cluster_centers= mini_batch_kmeans(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
+            #<<<<<<<<<<<<<<<<<<<<<  Kmeans >>>>>>>>>>>>>>>>>>>> 
+            # print("[Rank 0] Using Kmeans clustering...", flush=True)  
+            #### --------------------cpu版本------------------------
+            # kmeans = KMeans(n_clusters=args.num_clusters, random_state=0, n_init=10)
+            # kmeans.fit(concatenated_features)  # 先训练模型
+            # cluster_centers = kmeans.cluster_centers_  # 获取 ndarray
+            #### --------------------Gpu版本: 1次 --------------------------
+            # target_device = torch.device('cuda', args.local_rank)
+            # data_gpu = torch.from_numpy(concatenated_features).float().cuda()
+            # _, cluster_centers = kmeans(
+            #     X=data_gpu,
+            #     num_clusters=args.num_clusters,
+            #     distance='euclidean',
+            #     device=target_device,
+            # )
+            # cluster_centers = cluster_centers.cpu().numpy()
+            #### --------------------Gpu版本: 10次 --------------------------
+            # target_device = torch.device('cuda', args.local_rank)
+            # cluster_centers = gpu_kmeans_with_ninit(
+            #     features_np=concatenated_features.cpu().numpy(),
+            #     num_clusters=args.num_clusters,
+            #     device=target_device,
+            #     seed=args.seed,
+            #     logger=logger  # 将logger对象传递进去
+            # )
+
             logger.info("fuzzy_index: %s", args.fuzzy_index)    
             save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
             print(f"[Rank {args.local_rank}] Save path created: {save_path}")
@@ -588,7 +635,36 @@ def main():
         logger.info("  Num steps = %d", len(test_dataloader))
         logger.info("***** Running val *****")
         logger.info("  Num examples = %d", val_length)
-    if args.do_train:
+
+    # ✅ [修改] 核心逻辑重构：使用 if/elif 分离三种运行模式
+    # ✅ ================================================================
+    # --- 模式一：恢复模式 ---
+    if args.do_recover:
+        if args.recovery_epoch == -1:
+            raise ValueError("--recovery_epoch must be set when using --do_recover.")
+        if not args.init_model:
+            raise ValueError("--init_model must be set to the checkpoint you want to recover.")
+        
+        # 恢复任务只在主进程上执行
+        if args.local_rank == 0:
+            logger.info("--- RECOVERY MODE ACTIVATED ---")
+            logger.info(f"--- Performing recovery for epoch {args.recovery_epoch} ---")
+            # 1. 加载模型
+            model = init_model(args, device, n_gpu, args.local_rank)
+            train_dataloader, _, _ = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
+            # 2. 执行聚类
+            logger.info(f"Step 1: Starting feature extraction and clustering for epoch {args.recovery_epoch}.")
+            prototype_placeholder = torch.zeros(args.num_clusters, 512).to(device)
+            extract_clip_features_dist(model, train_dataloader, prototype_placeholder, device, args.recovery_epoch, args, name=f'recovery_{args.recovery_epoch}')
+            logger.info("Clustering finished.")
+            # 3. 执行评估
+            logger.info(f"Step 2: Starting evaluation for epoch {args.recovery_epoch}.")
+            R1 = eval_epoch(args, model, val_dataloader, device, n_gpu, args.recovery_epoch)
+            logger.info(f"--- Recovery evaluation finished. R@1 for epoch {args.recovery_epoch}: {R1:.4f} ---")
+            logger.info("--- Recovery complete. Exiting. ---")
+
+
+    elif args.do_train:
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
@@ -601,14 +677,6 @@ def main():
             logger.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
         
         
-        ##########   这里可能不需要事先提取聚类中心了
-        # if args.extract_feature:
-        #     prototype=load_cluster_centers(args,0)
-        #     if isinstance(prototype, np.ndarray):  
-        #         prototype = torch.from_numpy(prototype)
-        #     extract_clip_features_dist(model, train_dataloader,prototype, device, -1 , args, name='membership_contours_eval')
-        #     exit()
-
         best_score = 0.00001
         best_output_model_file = "None"
         resumed_epoch = 0
@@ -618,11 +686,31 @@ def main():
             resumed_epoch = checkpoint['epoch']+1
             resumed_loss = checkpoint['loss']
         global_step = 0
+        # didemo训练完整的
+        # lambda2_schedule = {
+        #     2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
+        #     6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0
+        # }
+        # lambda2_schedule = {
+        #     2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0,
+        #     6: 0.0, 7: 0.0, 8: 0.0, 9: 0.0
+        # }
+
+        ###### msrvtt
+        lambda2_schedule = {
+            2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
+            6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0
+        }
+        # lambda2_schedule = {
+        #     2: 1, 3: 1, 4: 1, 5: 1,
+        #     6: 1, 7: 1, 8: 1, 9: 1
+        # }
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
-            
+            current_lambda2 = lambda2_schedule.get(epoch, 0.0)
             ########................................................................第一步 train...........................................
-            tr_loss, global_step = train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=args.local_rank, writer=writer)
+            tr_loss, global_step = train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=args.local_rank, writer=writer, 
+                                                   lambda2_weight=current_lambda2)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
@@ -636,8 +724,16 @@ def main():
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
 
+                if epoch != args.epochs - 1 and epoch !=0:
+                # if epoch not in range(0, 11):
+                    logger.info("Starting feature extraction and clustering for the next epoch...")
+                    prototype_placeholder = torch.zeros(args.num_clusters, 512).to(device)
+                    extract_clip_features_dist(model, train_dataloader, prototype_placeholder, device, epoch, args, name=f'membership_contours_after_save_{epoch}')
+                    logger.info("Clustering finished.")
 
         writer.close()
+    
+    
     elif args.do_eval:
         if args.local_rank == 0:
             model.eval() 
