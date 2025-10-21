@@ -287,15 +287,7 @@ class MSRVTT_TrainDataLoader(Dataset):
 
         return video, video_mask
 
-    # def __getitem__(self, idx):
-    #     if self.unfold_sentences:
-    #         video_id, caption = self.sentences_dict[idx]
-    #     else:
-    #         video_id, caption = self.csv['video_id'].values[idx], None
-    #     pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(video_id, caption)
-    #     video, video_mask = self._get_rawvideo(choice_video_ids)
-    #     video_id_tensor = torch.tensor([video_id])
-    #     return pairs_text, pairs_mask, pairs_segment, video, video_mask,video_id_tensor
+
     def __getitem__(self, idx):
         if self.unfold_sentences:
             video_id, caption = self.sentences_dict[idx]
