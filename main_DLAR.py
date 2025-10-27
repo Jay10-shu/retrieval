@@ -631,11 +631,11 @@ def extract_clip_features_dist(model, dataloader, prototype, device, epoch, args
         #     metric='cosine'
         # )    
         #<<<<<<<<<<<<<<<<<<<<<  MINI-Fuzzy >>>>>>>>>>>>>>>>>>>>
-        print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
-        cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters, m=args.fuzzy_index)
+        # print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
+        # cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters, m=args.fuzzy_index)
         # <<<<<<<<<<<<<<<<<<<<<  MINI-Kmeans >>>>>>>>>>>>>>>>>>>>
-        # print("[Rank 0] Using mini-Kmeans clustering...", flush=True)
-        # cluster_centers= mini_batch_kmeans(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
+        print("[Rank 0] Using mini-Kmeans clustering...", flush=True)
+        cluster_centers= mini_batch_kmeans(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
         logger.info("fuzzy_index: %s", args.fuzzy_index)    
         save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
         print(f"[Rank {args.local_rank}] Save path created: {save_path}")
