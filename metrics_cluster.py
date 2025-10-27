@@ -83,6 +83,8 @@ def get_max_indices(a,b,top_k=10):
 #     JSD = JSD.view(batch_size_t, batch_size) # -> 维度为 [M, N]
 #     Sim = -JSD
 #     return Sim
+
+
 # def compute_KL(v_alpha,t_alpha):
 #     epsilon = 1e-8
 #     v_alpha = v_alpha + epsilon
@@ -153,29 +155,111 @@ def clusterSim_jsd(v_alpha, t_alpha):
     sim_matrix = -jsd_matrix     
     return sim_matrix
 
+
+
+
+
+
+# def cluster_similarity_cosine(v_alpha, t_alpha):
+#     """
+#     根据视频和文本 alpha 向量（作为特征）之间的余弦相似度计算相似度矩阵。
+
+#     此函数确保输出矩阵的维度与标准的 text-to-video 检索任务一致。
+
+#     Args:
+#         v_alpha (torch.Tensor): 视频的 alpha 参数, 形状为 [N, K] (N 个视频, K 个簇)
+#         t_alpha (torch.Tensor): 文本的 alpha 参数, 形状为 [M, K] (M 个文本, K 个簇)
+
+#     Returns:
+#         torch.Tensor: 相似度矩阵, 形状为 [M, N]。
+#                       其中 sim_matrix[i, j] 代表第 i 个文本和第 j 个视频的相似度。
+#     """
+#     # --- 关键步骤 1: L2 归一化 ---
+#     # 将 alpha 向量归一化为单位向量，这是通过矩阵乘法计算余弦相似度的前提。
+#     v_alpha_norm = F.normalize(v_alpha, p=2, dim=1)
+#     t_alpha_norm = F.normalize(t_alpha, p=2, dim=1)
+
+#     # --- 关键步骤 2: 矩阵乘法以确保方向正确 ---
+#     # 我们的目标是得到一个 [M, N] 的矩阵。
+#     # t_alpha_norm 的形状是 [M, K]。
+#     # v_alpha_norm 的形状是 [N, K]。
+#     # 为了得到 [M, N]，我们需要将 [M, K] 矩阵与 [K, N] 矩阵相乘。
+#     # 因此，我们需要对 v_alpha_norm 进行转置 (transpose)。
+#     # 运算: (M, K) @ (K, N) -> (M, N)
+#     sim_matrix = torch.matmul(t_alpha_norm, v_alpha_norm.t())
+#     return sim_matrix
+
+
+
+
+####################################################
+# def kl_divergence_matrix(v_alpha, t_alpha):
+#     """
+#     Calculates a similarity matrix based on the negative KL Divergence
+#     between video and text Dirichlet distributions.
+#     Args:
+#         v_alpha: Video alpha parameters, shape [N, K] (N videos, K clusters)
+#         t_alpha: Text alpha parameters, shape [M, K] (M texts, K clusters)
+#     Returns:
+#         Similarity matrix, shape [M, N]
+#     """
+#     num_videos = v_alpha.shape[0]
+#     num_texts = t_alpha.shape[0]
+
+#     # --- This expansion logic is the key part ---
+#     # Create all-pairs for batch computation, resulting in tensors of shape [M*N, K]
+#     v_alpha_expanded = v_alpha.unsqueeze(0).repeat(num_texts, 1, 1).view(-1, v_alpha.shape[1])
+#     t_alpha_expanded = t_alpha.unsqueeze(1).repeat(1, num_videos, 1).view(-1, t_alpha.shape[1])
+#     kl_t_v = kl_divergence_dirichlet(t_alpha_expanded, v_alpha_expanded)
+#     kl_v_t = kl_divergence_dirichlet(v_alpha_expanded, t_alpha_expanded)
+#     sym_kl_divergence = 0.5 * (kl_t_v + kl_v_t)
+#     kl_matrix = sym_kl_divergence.view(num_texts, num_videos) # -> shape [M, N]
+#     sim_matrix = -kl_matrix
+#     return sim_matrix
+
 def kl_divergence_dirichlet(alpha, beta):
     """
-    Calculates the KL divergence between two Dirichlet distributions.
+    Calculates the KL divergence between two sets of Dirichlet parameters.
     KL(Dir(alpha) || Dir(beta))
-    
     Args:
-        alpha: Parameters of the first distribution, shape [N, K]
-        beta: Parameters of the second distribution, shape [N, K]
-    
+        alpha: Parameters of the first distribution, shape: [B, K]
+        beta: Parameters of the second distribution, shape: [B, K]
     Returns:
-        KL divergence, shape [N]
+        KL divergence, shape: [B]
     """
-    # Ensure parameters are on the same device
     beta = beta.to(alpha.device)
     sum_alpha = torch.sum(alpha, dim=1)
     sum_beta = torch.sum(beta, dim=1)
-    # Log of Gamma functions
     term1 = torch.lgamma(sum_alpha) - torch.lgamma(sum_beta)
-    # Sum of log of Gamma functions for individual parameters
-    term2 = torch.sum(torch.lgamma(beta) - torch.lgamma(alpha), dim=1)     
-    # Digamma functions part
+    term2 = torch.sum(torch.lgamma(beta) - torch.lgamma(alpha), dim=1)
     alpha_minus_beta = alpha - beta
     digamma_alpha = torch.digamma(alpha)
-    digamma_sum_alpha = torch.digamma(sum_alpha).unsqueeze(1).expand_as(alpha)     
-    term3 = torch.sum(alpha_minus_beta * (digamma_alpha - digamma_sum_alpha), dim=1)    
+    digamma_sum_alpha = torch.digamma(sum_alpha).unsqueeze(1).expand_as(alpha)
+    term3 = torch.sum(alpha_minus_beta * (digamma_alpha - digamma_sum_alpha), dim=1)
     return term1 + term2 + term3
+
+def kl_divergence_matrix(v_alpha, t_alpha):
+    """
+    Calculates a similarity matrix based on the negative KL Divergence
+    between video and text Dirichlet distributions.
+    Args:
+        v_alpha: Video alpha parameters, shape [N, K] (N videos, K clusters)
+        t_alpha: Text alpha parameters, shape [M, K] (M texts, K clusters)
+    Returns:
+        sim_matrix_for_T2V: Similarity for Text-to-Video, shape [M, N]
+        sim_matrix_for_V2T: Similarity for Video-to-Text, shape [N, M]
+    """
+    num_videos = v_alpha.shape[0]
+    num_texts = t_alpha.shape[0]
+    # --- 扩展逻辑不变 ---
+    v_alpha_expanded = v_alpha.unsqueeze(0).repeat(num_texts, 1, 1).view(-1, v_alpha.shape[1])
+    t_alpha_expanded = t_alpha.unsqueeze(1).repeat(1, num_videos, 1).view(-1, t_alpha.shape[1])
+    kl_t_v = kl_divergence_dirichlet(t_alpha_expanded, v_alpha_expanded)
+    kl_v_t = kl_divergence_dirichlet(v_alpha_expanded, t_alpha_expanded)
+    # [M, N]
+    sim_matrix_for_T2V = -kl_t_v.view(num_texts, num_videos)
+    # [N, M]
+    sim_matrix_for_V2T = (-kl_v_t.view(num_texts, num_videos))
+    # print('sim_matrix_for_T2V \n',sim_matrix_for_T2V)
+
+    return sim_matrix_for_T2V, sim_matrix_for_V2T
