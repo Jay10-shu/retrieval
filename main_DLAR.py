@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 from __future__ import print_function
 from collections import defaultdict
 import torch
+from tqdm import tqdm
 import numpy as np
 import random
 import os
@@ -243,9 +244,11 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
         if isinstance(prototype, np.ndarray):  
             prototype = torch.from_numpy(prototype)
 
-
     for step, batch in enumerate(train_dataloader):
-        input_ids, input_mask, segment_ids, video, video_mask = batch
+        if args.datatype == "msrvtt":    
+            input_ids, input_mask, segment_ids, video, video_mask, _ = batch
+        else:
+            input_ids, input_mask, segment_ids, video, video_mask = batch
         loss, loss_set, _, _ = model(epoch, input_ids, segment_ids, input_mask, video, prototype.detach(), video_mask, lambda2=lambda2_weight)
         if n_gpu > 1:
             loss = loss.mean()
@@ -282,8 +285,6 @@ def train_epoch_all(epoch, args, model, train_dataloader, device, n_gpu, optimiz
                     writer.flush() 
                 start_time = time.time()
     total_loss = total_loss / len(train_dataloader)
-    # if epoch != args.epochs - 1 and epoch !=0 :
-        # extract_clip_features_dist(model, train_dataloader,prototype, device, epoch, args, name=f'membership_contours_{epoch}')
     return total_loss, global_step
 
 
@@ -319,7 +320,6 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
         Sim_cluster_matrix_V2T.append(each_row_cluster_v2t)
 
     return sim_feature_matrix, Sim_cluster_matrix_T2V, Sim_cluster_matrix_V2T
-
 
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
@@ -413,31 +413,6 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
     vt_metrics_sim_feature, _ = compute_metrics(sim_feature.T)
     vt_metrics_sim_cluster, _ = compute_metrics(sim_cluster_V2T.T)
     vt_metrics_sim_all, _ = compute_metrics(sim_all_V2T)    
-    def print_sim(name, sim):
-        # 确保在 CPU 上并转为 NumPy
-        if isinstance(sim, torch.Tensor):
-            sim_np = sim.detach().cpu().numpy()
-        else:
-            sim_np = sim  # 已是 NumPy
-
-        print(f"\n{'='*50}")
-        print(f"Matrix: {name}")
-        print(f"Shape: {sim_np.shape}")
-        print(f"Range: [{sim_np.min():.6f}, {sim_np.max():.6f}]")
-        print(f"Mean ± Std: {sim_np.mean():.6f} ± {sim_np.std():.6f}")
-        
-        # 打印左上角 3x5（文本数 x 视频数，通常不对称）
-        rows, cols = min(3, sim_np.shape[0]), min(5, sim_np.shape[1])
-        print(f"\nTop-left {rows}x{cols} values:")
-        print(sim_np[:rows, :cols]) 
-    print_sim("sim_feature (T2V)", sim_feature)
-    print_sim("sim_cluster_T2V", sim_cluster_T2V)
-    print_sim("sim_all_T2V", sim_all_T2V)
-
-    # --- 打印 V2T 相似度矩阵（即转置后的）---
-    print_sim("sim_feature.T (V2T)", sim_feature.T)
-    print_sim("sim_cluster_V2T.T", sim_cluster_V2T.T)   # 注意变量名是 V2T
-    print_sim("sim_all_V2T.T", sim_all_V2T.T)
 
     logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_feature), len(sim_feature[0])))
     if multi_sentence_ == False:
@@ -485,111 +460,218 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu, epoch):
     R1 = tv_metrics_sim_all['R1']
     return R1
 
-def extract_clip_features_dist(model, dataloader,prototype, device, epoch, args, name):
+# def extract_clip_features_dist(model, dataloader,prototype, device, epoch, args, name):
+#     import os 
+#     model.eval()
+#     text_features_list = []
+#     video_features_list = []
+#     if args.n_gpu > 1:
+#         torch.distributed.barrier()
+#         print(f"[Rank {args.local_rank}] Passed initial barrier.")
+#     with torch.no_grad():
+#         for batch_idx, batch in enumerate(dataloader):
+#             batch = tuple(t.to(device, non_blocking=True) for t in batch)
+#             input_ids, input_mask, segment_ids, video, video_mask = batch
+#             text_features, video_features = model(
+#                 1, input_ids, segment_ids, input_mask, video, prototype, video_mask
+#             )
+#             if args.n_gpu > 1:
+#                 gathered_text = [torch.zeros_like(text_features) for _ in range(torch.distributed.get_world_size())]
+#                 gathered_video = [torch.zeros_like(video_features) for _ in range(torch.distributed.get_world_size())]
+#                 torch.distributed.all_gather(gathered_text, text_features)
+#                 torch.distributed.all_gather(gathered_video, video_features)
+#                 if args.local_rank == 0:
+#                     text_features = torch.cat(gathered_text, dim=0)
+#                     video_features = torch.cat(gathered_video, dim=0)
+#             text_features_list.append(text_features.cpu())
+#             video_features_list.append(video_features.cpu())
+#         if args.local_rank == 0:
+#             text_features_ = torch.cat(text_features_list, dim=0)
+#             video_features_ = torch.cat(video_features_list, dim=0)
+#             concatenated_features = torch.cat((text_features_, video_features_), dim=0)
+#             #<<<<<<<<<<<<<<<<<<<<<  Fuzzy >>>>>>>>>>>>>>>>>>>>
+#             # print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
+#             cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
+#                 data=concatenated_features.T.cpu().numpy(),
+#                 c=args.num_clusters,
+#                 m=args.fuzzy_index, 
+#                 error=0.0001,
+#                 maxiter=100,
+#                 metric='cosine'
+#             )    
+#             #<<<<<<<<<<<<<<<<<<<<<  MINI-Fuzzy >>>>>>>>>>>>>>>>>>>>
+#             # print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
+#             # cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
+#             logger.info("fuzzy_index: %s", args.fuzzy_index)    
+#             save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
+#             print(f"[Rank {args.local_rank}] Save path created: {save_path}")
+#             if not os.path.exists(save_path):
+#                 os.makedirs(save_path)
+#             cluster_epoch_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch}.pt')
+#             torch.save(cluster_centers, cluster_epoch_path)
+#             logger.info(f"[Rank 0] Cluster centers saved to: {cluster_epoch_path}")
+#             if args.n_gpu > 1:
+#                 cluster_centers_tensor = torch.tensor(cluster_centers, dtype=torch.float32).to(device)
+#                 torch.distributed.broadcast(cluster_centers_tensor, src=0)
+#         if args.n_gpu > 1 and args.local_rank != 0:
+#             cluster_centers_tensor = torch.zeros((args.num_clusters, 512), dtype=torch.float32).to(device)
+#             torch.distributed.broadcast(cluster_centers_tensor, src=0)
+#             cluster_centers = cluster_centers_tensor.cpu().numpy()
+#         if args.n_gpu > 1:
+#             torch.distributed.barrier()
+#             print(f"[Rank {args.local_rank}] Passed final barrier.")
+#     model.train()
+
+
+def extract_clip_features_dist(model, dataloader, prototype, device, epoch, args, name):
+    """
+    修改后的函数:
+    - MSRVTT (1-to-N): 提取 180k 文本特征 + 9k 唯一视频特征
+    - 其他 (1-to-1): 提取 N 文本特征 + N 视频特征
+    然后将它们合并进行聚类。
+    """
     model.eval()
-    text_features_list = []
-    video_features_list = []
+    if args.local_rank == 0:
+        all_text_features_list = []
+        if args.datatype == "msrvtt":
+            unique_video_features_dict = {}  # MSRVTT: 使用字典去重
+            unique_video_ids_list = []       # MSRVTT: 保持顺序
+        else:
+            all_video_features_list = []     # 1-to-1: 直接用列表
+            
     if args.n_gpu > 1:
         torch.distributed.barrier()
-        print(f"[Rank {args.local_rank}] Passed initial barrier.")
+    
     with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            batch = tuple(t.to(device, non_blocking=True) for t in batch)
-            input_ids, input_mask, segment_ids, video, video_mask = batch
+        data_iter = dataloader
+        if args.local_rank == 0:
+            data_iter = tqdm(dataloader, desc=f"Extracting Features for Epoch {epoch}")
+            
+        for batch_idx, batch in enumerate(data_iter):
+            
+            # 1. 条件解包
+            if args.datatype == "msrvtt":
+                # MSRVTT: 最后一个是 video_id 列表 (字符串)
+                video_ids = batch[-1]
+                batch_tensors = tuple(t.to(device, non_blocking=True) for t in batch[:-1])
+                input_ids, input_mask, segment_ids, video, video_mask = batch_tensors
+            else:
+                # 1-to-1: 全部是张量
+                video_ids = None # 设为 None
+                batch_tensors = tuple(t.to(device, non_blocking=True) for t in batch)
+                input_ids, input_mask, segment_ids, video, video_mask = batch_tensors
+            
+            # 2. 获取特征
             text_features, video_features = model(
                 1, input_ids, segment_ids, input_mask, video, prototype, video_mask
             )
+
+            # 3. 分布式收集 (Gather)
             if args.n_gpu > 1:
                 gathered_text = [torch.zeros_like(text_features) for _ in range(torch.distributed.get_world_size())]
                 gathered_video = [torch.zeros_like(video_features) for _ in range(torch.distributed.get_world_size())]
                 torch.distributed.all_gather(gathered_text, text_features)
                 torch.distributed.all_gather(gathered_video, video_features)
-                if args.local_rank == 0:
-                    text_features = torch.cat(gathered_text, dim=0)
-                    video_features = torch.cat(gathered_video, dim=0)
-            text_features_list.append(text_features.cpu())
-            video_features_list.append(video_features.cpu())
-        if args.local_rank == 0:
-            text_features_ = torch.cat(text_features_list, dim=0)
-            video_features_ = torch.cat(video_features_list, dim=0)
-            concatenated_features = torch.cat((text_features_, video_features_), dim=0)
-            #<<<<<<<<<<<<<<<<<<<<<  Fuzzy >>>>>>>>>>>>>>>>>>>>
-            # print("[Rank 0] Using Fuzzy C-Means clustering...", flush=True)
-            # cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
-            #     data=concatenated_features.T.cpu().numpy(),
-            #     c=args.num_clusters,
-            #     m=args.fuzzy_index, 
-            #     error=0.0001,
-            #     maxiter=100,
-            #     metric='cosine'
-            # )    
-            #<<<<<<<<<<<<<<<<<<<<<  MINI-Fuzzy >>>>>>>>>>>>>>>>>>>>
-            print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
-            cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
-            # <<<<<<<<<<<<<<<<<<<<<  MINI-Kmeans >>>>>>>>>>>>>>>>>>>>
-            # print("[Rank 0] Using mini-Kmeans clustering...", flush=True)
-            # cluster_centers= mini_batch_kmeans(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
-            #<<<<<<<<<<<<<<<<<<<<<  Kmeans >>>>>>>>>>>>>>>>>>>> 
-            # print("[Rank 0] Using Kmeans clustering...", flush=True)  
-            #### --------------------cpu版本------------------------
-            # kmeans = KMeans(n_clusters=args.num_clusters, random_state=0, n_init=10)
-            # kmeans.fit(concatenated_features)  # 先训练模型
-            # cluster_centers = kmeans.cluster_centers_  # 获取 ndarray
-            #### --------------------Gpu版本: 1次 --------------------------
-            # target_device = torch.device('cuda', args.local_rank)
-            # data_gpu = torch.from_numpy(concatenated_features).float().cuda()
-            # _, cluster_centers = kmeans(
-            #     X=data_gpu,
-            #     num_clusters=args.num_clusters,
-            #     distance='euclidean',
-            #     device=target_device,
-            # )
-            # cluster_centers = cluster_centers.cpu().numpy()
-            #### --------------------Gpu版本: 10次 --------------------------
-            # target_device = torch.device('cuda', args.local_rank)
-            # cluster_centers = gpu_kmeans_with_ninit(
-            #     features_np=concatenated_features.cpu().numpy(),
-            #     num_clusters=args.num_clusters,
-            #     device=target_device,
-            #     seed=args.seed,
-            #     logger=logger  # 将logger对象传递进去
-            # )
+                
+                if args.datatype == "msrvtt":
+                    gathered_video_ids = [None for _ in range(torch.distributed.get_world_size())]
+                    torch.distributed.all_gather_object(gathered_video_ids, video_ids)
+            
+            # 4. 只在 Rank 0 (主进程) 上处理收集到的数据
+            if args.local_rank == 0:
+                if args.n_gpu > 1:
+                    gathered_text_cpu = torch.cat(gathered_text, dim=0).cpu()
+                    gathered_video_cpu = torch.cat(gathered_video, dim=0).cpu()
+                    if args.datatype == "msrvtt":
+                        gathered_video_ids_flat = [item for sublist in gathered_video_ids for item in sublist]
+                else:
+                    gathered_text_cpu = text_features.cpu()
+                    gathered_video_cpu = video_features.cpu()
+                    if args.datatype == "msrvtt":
+                        gathered_video_ids_flat = video_ids
+                
+                all_text_features_list.append(gathered_text_cpu)
+                
+                if args.datatype == "msrvtt":
+                    for i in range(len(gathered_video_ids_flat)):
+                        vid = gathered_video_ids_flat[i]
+                        if vid not in unique_video_features_dict:
+                            unique_video_features_dict[vid] = gathered_video_cpu[i]
+                            unique_video_ids_list.append(vid)
+                else:
+                    all_video_features_list.append(gathered_video_cpu)
 
-            logger.info("fuzzy_index: %s", args.fuzzy_index)    
-            save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
-            print(f"[Rank {args.local_rank}] Save path created: {save_path}")
-            if not os.path.exists(save_path):
-                os.makedirs(save_path)
-            # membership_sums = membership_matrix.sum(axis=0)
-            # is_valid = np.allclose(membership_sums, 1, atol=1e-6)
-            cluster_epoch_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch}.pt')
-            torch.save(cluster_centers, cluster_epoch_path)
-            logger.info(f"[Rank 0] Cluster centers saved to: {cluster_epoch_path}")
-            if args.n_gpu > 1:
-                cluster_centers_tensor = torch.tensor(cluster_centers, dtype=torch.float32).to(device)
-                torch.distributed.broadcast(cluster_centers_tensor, src=0)
-        if args.n_gpu > 1 and args.local_rank != 0:
-            cluster_centers_tensor = torch.zeros((args.num_clusters, 512), dtype=torch.float32).to(device)
-            torch.distributed.broadcast(cluster_centers_tensor, src=0)
-            cluster_centers = cluster_centers_tensor.cpu().numpy()
+    # 5. [缩进已修复] Rank 0: 聚类
+    # 这个 'if' 语句是 4 个空格
+    if args.local_rank == 0:
+        # 这一行是 8 个空格
+        logger.info("Feature extraction complete. Starting clustering on Rank 0.")
+        
+        # [!!!] 这一行 (你的第 592 行) 现在也是 8 个空格
+        text_features_ = torch.cat(all_text_features_list, dim=0)
+        logger.info(f"Collected {text_features_.shape[0]} text features.")
+        
+        # 后面所有代码都已修正为正确的 8 空格或 12 空格缩进
+        if args.datatype == "msrvtt":
+            video_features_ = torch.stack([unique_video_features_dict[vid] for vid in unique_video_ids_list], dim=0)
+            logger.info(f"Collected {video_features_.shape[0]} unique video features (MSRVTT mode).")
+        else:
+            video_features_ = torch.cat(all_video_features_list, dim=0)
+            logger.info(f"Collected {video_features_.shape[0]} video features (1-to-1 mode).")
+            
+        concatenated_features = torch.cat((text_features_, video_features_), dim=0)
+        logger.info(f"Total features for clustering: {concatenated_features.shape[0]}")
+        #<<<<<<<<<<<<<<<<<<<<<  Fuzzy >>>>>>>>>>>>>>>>>>>>        
+        # cluster_centers, membership_matrix, _, d, _, _, _ = fuzz.cmeans(
+        #     data=concatenated_features.T.cpu().numpy(),
+        #     c=args.num_clusters,
+        #     m=args.fuzzy_index, 
+        #     error=0.0001,
+        #     maxiter=100,
+        #     metric='cosine'
+        # )    
+        #<<<<<<<<<<<<<<<<<<<<<  MINI-Fuzzy >>>>>>>>>>>>>>>>>>>>
+        print("[Rank 0] Using mini-Fuzzy C-Means clustering...", flush=True)
+        cluster_centers= mini_batch_fcm(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters, m=args.fuzzy_index)
+        # <<<<<<<<<<<<<<<<<<<<<  MINI-Kmeans >>>>>>>>>>>>>>>>>>>>
+        # print("[Rank 0] Using mini-Kmeans clustering...", flush=True)
+        # cluster_centers= mini_batch_kmeans(concatenated_features.cpu().numpy(), num_clusters=args.num_clusters)
+        logger.info("fuzzy_index: %s", args.fuzzy_index)    
+        save_path = f"./{args.output_dir}/cluster-results_{args.num_clusters}_{args.fuzzy_index}"
+        print(f"[Rank {args.local_rank}] Save path created: {save_path}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        
+        cluster_epoch_path = os.path.join(args.output_dir, f'cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch}.pt')
+        torch.save(cluster_centers, cluster_epoch_path)
+        logger.info(f"[Rank 0] Cluster centers saved to: {cluster_epoch_path}")
+        
         if args.n_gpu > 1:
-            torch.distributed.barrier()
-            print(f"[Rank {args.local_rank}] Passed final barrier.")
+            cluster_centers_tensor = torch.tensor(cluster_centers, dtype=torch.float32).to(device)
+            torch.distributed.broadcast(cluster_centers_tensor, src=0)
+    
+    if args.n_gpu > 1 and args.local_rank != 0:
+        cluster_centers_tensor = torch.zeros((args.num_clusters, 512), dtype=torch.float32).to(device)
+        torch.distributed.broadcast(cluster_centers_tensor, src=0)
+    
+    if args.n_gpu > 1:
+        torch.distributed.barrier()
+        
     model.train()
 
 def load_cluster_centers(args, epoch):
-    import os
     epoch1 = epoch-1 
     cluster_path = os.path.join(f'./{args.output_dir}/cluster_centers_{args.datatype}_{args.num_clusters}_{args.fuzzy_index}_{epoch1}.pt') 
     if os.path.exists(cluster_path):
         prototype = torch.load(cluster_path)
         prototype = torch.from_numpy(prototype)
         prototype = F.normalize(prototype, p=2, dim=1)
-        print(f'Cluster centers loaded from {cluster_path}')
+        logger.info(f'Cluster centers loaded from {cluster_path}')
     else:
         logger.warning("Cluster centers file not found at: %s", cluster_path)
         prototype = torch.zeros(args.num_clusters, 512)
     return  prototype
+
 
 def main():
     global logger
@@ -644,25 +726,18 @@ def main():
             raise ValueError("--recovery_epoch must be set when using --do_recover.")
         if not args.init_model:
             raise ValueError("--init_model must be set to the checkpoint you want to recover.")
-        
-        # 恢复任务只在主进程上执行
         if args.local_rank == 0:
             logger.info("--- RECOVERY MODE ACTIVATED ---")
             logger.info(f"--- Performing recovery for epoch {args.recovery_epoch} ---")
-            # 1. 加载模型
             model = init_model(args, device, n_gpu, args.local_rank)
+            if args.datatype == "msrvtt":
+                logger.info("Forcing 'expand_msrvtt_sentences = True' for MSRVTT feature extraction.")
+                args.expand_msrvtt_sentences = True
             train_dataloader, _, _ = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
-            # 2. 执行聚类
             logger.info(f"Step 1: Starting feature extraction and clustering for epoch {args.recovery_epoch}.")
             prototype_placeholder = torch.zeros(args.num_clusters, 512).to(device)
             extract_clip_features_dist(model, train_dataloader, prototype_placeholder, device, args.recovery_epoch, args, name=f'recovery_{args.recovery_epoch}')
             logger.info("Clustering finished.")
-            # 3. 执行评估
-            logger.info(f"Step 2: Starting evaluation for epoch {args.recovery_epoch}.")
-            R1 = eval_epoch(args, model, val_dataloader, device, n_gpu, args.recovery_epoch)
-            logger.info(f"--- Recovery evaluation finished. R@1 for epoch {args.recovery_epoch}: {R1:.4f} ---")
-            logger.info("--- Recovery complete. Exiting. ---")
-
 
     elif args.do_train:
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
@@ -687,24 +762,23 @@ def main():
             resumed_loss = checkpoint['loss']
         global_step = 0
         # didemo训练完整的
-        # lambda2_schedule = {
-        #     2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
-        #     6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0
-        # }
+        lambda2_schedule = {
+            2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
+            6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0
+        }
         # lambda2_schedule = {
         #     2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0,
         #     6: 0.0, 7: 0.0, 8: 0.0, 9: 0.0
         # }
 
         ###### msrvtt
-        lambda2_schedule = {
-            2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
-            6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0
-        }
         # lambda2_schedule = {
-        #     2: 1, 3: 1, 4: 1, 5: 1,
-        #     6: 1, 7: 1, 8: 1, 9: 1
-        # }
+        # 2: 0.001, 3: 0.01,
+        # 4: 0.02, 5: 0.03,  6: 0.01,  7: 0.01,  8: 0.01, 9: 0.01,
+        # 10: 0.05,  11: 0.05, 12: 0.05, 13: 0.05, 14: 0.05, 
+        # 15: 0.3, 16: 0.3,  
+        # 17: 1.0, 18: 1.0, 19: 1.0  
+        #         }
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
             current_lambda2 = lambda2_schedule.get(epoch, 0.0)
@@ -713,7 +787,11 @@ def main():
                                                    lambda2_weight=current_lambda2)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
-                output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
+                if (epoch + 1) % 1 == 0:
+                    output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
+                    logger.info(f"--- Model saved at epoch {epoch} ---")
+                else:
+                    output_model_file = None # 非保存轮次
                 logger.info(f'Eval on val dataset-{args.num_clusters}_{args.fuzzy_index}')    
             
             ########................................................................第一步 test...........................................    
@@ -723,9 +801,9 @@ def main():
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
-
+  
+                # if epoch not in range(-1, 11):
                 if epoch != args.epochs - 1 and epoch !=0:
-                # if epoch not in range(0, 11):
                     logger.info("Starting feature extraction and clustering for the next epoch...")
                     prototype_placeholder = torch.zeros(args.num_clusters, 512).to(device)
                     extract_clip_features_dist(model, train_dataloader, prototype_placeholder, device, epoch, args, name=f'membership_contours_after_save_{epoch}')
